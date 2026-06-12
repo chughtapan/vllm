@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -153,6 +153,10 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        free_block_queue_factory: Callable[
+            [list[KVCacheBlock]], FreeKVCacheBlockQueue
+        ]
+        | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -164,8 +168,12 @@ class BlockPool:
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # enabled). An alternative queue with the same interface (e.g.
+        # CacheWise predictive eviction) can be injected via the factory.
+        if free_block_queue_factory is None:
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        else:
+            self.free_block_queue = free_block_queue_factory(self.blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "prefix_aware"]
 
 
 @config
@@ -109,10 +109,23 @@ class SchedulerConfig:
     policy: SchedulerPolicy = "fcfs"
     """The scheduling policy to use:
 
-    - "fcfs" means first come first served, i.e. requests are handled in order 
+    - "fcfs" means first come first served, i.e. requests are handled in order
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "prefix_aware" means waiting requests needing the fewest additional KV
+      cache blocks (i.e. with the highest prefix cache overlap) are handled
+      first, with time of arrival deciding ties. Optimizes session completion
+      time for agentic workloads; per-request priority is ignored."""
+
+    prefix_aware_max_wait_s: float = Field(default=30.0, ge=0)
+    """For the "prefix_aware" policy: a waiting request older than this many
+    seconds is scheduled in FCFS order regardless of its prefix cache overlap,
+    preventing starvation. 0 disables the override."""
+
+    prefix_aware_max_candidates: int = Field(default=64, ge=1)
+    """For the "prefix_aware" policy: the maximum number of oldest waiting
+    requests scored for prefix cache overlap at each scheduling decision."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

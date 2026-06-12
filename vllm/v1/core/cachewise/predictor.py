@@ -1,0 +1,273 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tool-call duration predictor for CacheWise predictive eviction."""
+
+import json
+import math
+import os
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+# Key for samples of turns that ended without any tool call: the session
+# returns when the human responds, on a much slower timescale than tools.
+HUMAN_PAUSE_KEY = "__human__"
+
+# Histogram resolution shared by all duration distributions.
+_NUM_BINS = 64
+_MIN_DURATION_S = 0.01
+_MAX_DURATION_S = 3600.0
+_LOG_MIN = math.log(_MIN_DURATION_S)
+_LOG_MAX = math.log(_MAX_DURATION_S)
+_LOG_STEP = (_LOG_MAX - _LOG_MIN) / _NUM_BINS
+
+# Minimum number of samples per tool before argument clustering kicks in.
+_MIN_SAMPLES_FOR_CLUSTERING = 100
+# Number of new samples per tool between clustering refits.
+_REFIT_SAMPLE_INTERVAL = 256
+_NUM_CLUSTERS = 8
+_TFIDF_MAX_FEATURES = 512
+
+
+def _bin_index(duration_s: float) -> int:
+    if duration_s <= _MIN_DURATION_S:
+        return 0
+    idx = int((math.log(duration_s) - _LOG_MIN) / _LOG_STEP)
+    return min(idx, _NUM_BINS - 1)
+
+
+def _bin_mean(idx: int) -> float:
+    """Geometric mean of a bin's bounds, used as its representative value."""
+    return math.exp(_LOG_MIN + (idx + 0.5) * _LOG_STEP)
+
+
+class DurationDistribution:
+    """Log-spaced histogram of observed durations.
+
+    Supports conditional expectation queries of the form
+    E[duration - elapsed | duration > elapsed].
+    """
+
+    def __init__(self) -> None:
+        self.counts = [0] * _NUM_BINS
+        self.num_samples = 0
+        self.max_observed_s = 0.0
+
+    def record(self, duration_s: float) -> None:
+        self.counts[_bin_index(duration_s)] += 1
+        self.num_samples += 1
+        self.max_observed_s = max(self.max_observed_s, duration_s)
+
+    def expected_remaining(self, elapsed_s: float) -> float | None:
+        """Expected remaining seconds until completion given elapsed time.
+
+        Returns None when the distribution has no samples. When the elapsed
+        time exceeds (almost) all observed durations, returns a bounded
+        heuristic tail instead of extrapolating from an empty histogram.
+        """
+        if self.num_samples == 0:
+            return None
+        start_bin = _bin_index(elapsed_s) if elapsed_s > _MIN_DURATION_S else 0
+        surviving = 0
+        total_s = 0.0
+        for idx in range(start_bin, _NUM_BINS):
+            count = self.counts[idx]
+            if count == 0:
+                continue
+            bin_mean = _bin_mean(idx)
+            if bin_mean <= elapsed_s:
+                continue
+            surviving += count
+            total_s += count * (bin_mean - elapsed_s)
+        if surviving == 0:
+            # Prediction is overdue: every observed duration has passed.
+            return max(self.max_observed_s * 1.5, elapsed_s * 0.5)
+        return total_s / surviving
+
+
+class ToolReusePredictor:
+    """Predicts how long until an agent session issues its next request.
+
+    Maintains per-tool empirical duration distributions, optionally refined
+    by clustering tool-call arguments (TF-IDF + KMeans, requires
+    scikit-learn). Falls back from cluster to tool-name to global
+    distributions, and finally to ``default_reuse_s``.
+    """
+
+    def __init__(
+        self,
+        default_reuse_s: float,
+        use_clustering: bool = False,
+        bootstrap_path: str | None = None,
+    ) -> None:
+        self.default_reuse_s = default_reuse_s
+        self.global_dist = DurationDistribution()
+        self.tool_dists: dict[str, DurationDistribution] = {}
+
+        self.use_clustering = use_clustering and self._sklearn_available()
+        if use_clustering and not self.use_clustering:
+            logger.warning_once(
+                "cachewise_predictor='tfidf_kmeans' requires scikit-learn; "
+                "falling back to per-tool-name distributions."
+            )
+        # Per-tool raw samples retained for clustering refits, and the
+        # fitted per-tool models: (vectorizer, kmeans, cluster distributions).
+        self._samples: dict[str, list[tuple[str, float]]] = {}
+        self._samples_since_refit: dict[str, int] = {}
+        self._cluster_models: dict[str, tuple] = {}
+
+        if bootstrap_path is not None:
+            self._load_bootstrap(bootstrap_path)
+
+    @staticmethod
+    def _sklearn_available() -> bool:
+        try:
+            import sklearn  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    @staticmethod
+    def _key(tools: list[tuple[str, str]]) -> str:
+        """Distribution key for a turn's tool calls.
+
+        Parallel tool batches map to a composite key of sorted names so that
+        single-tool distributions are not polluted by batched turns.
+        """
+        if not tools:
+            return HUMAN_PAUSE_KEY
+        names = sorted(name for name, _ in tools)
+        return "+".join(names)
+
+    def record(self, tools: list[tuple[str, str]], duration_s: float) -> None:
+        """Record an observed (tool calls -> session return) duration."""
+        key = self._key(tools)
+        dist = self.tool_dists.get(key)
+        if dist is None:
+            dist = self.tool_dists[key] = DurationDistribution()
+        dist.record(duration_s)
+        self.global_dist.record(duration_s)
+        if self.use_clustering and key != HUMAN_PAUSE_KEY:
+            args = " ".join(arg for _, arg in tools)
+            self._samples.setdefault(key, []).append((args, duration_s))
+            self._samples_since_refit[key] = (
+                self._samples_since_refit.get(key, 0) + 1
+            )
+
+    def predict_remaining(
+        self, tools: list[tuple[str, str]], elapsed_s: float
+    ) -> float:
+        """Expected seconds until the session's next request arrives."""
+        key = self._key(tools)
+        if self.use_clustering:
+            estimate = self._predict_from_cluster(key, tools, elapsed_s)
+            if estimate is not None:
+                return estimate
+        dist = self.tool_dists.get(key)
+        if dist is not None:
+            estimate = dist.expected_remaining(elapsed_s)
+            if estimate is not None:
+                return estimate
+        estimate = self.global_dist.expected_remaining(elapsed_s)
+        if estimate is not None:
+            return estimate
+        return self.default_reuse_s
+
+    def _predict_from_cluster(
+        self, key: str, tools: list[tuple[str, str]], elapsed_s: float
+    ) -> float | None:
+        model = self._cluster_models.get(key)
+        if model is None:
+            return None
+        vectorizer, kmeans, cluster_dists = model
+        args = " ".join(arg for _, arg in tools)
+        try:
+            cluster = int(kmeans.predict(vectorizer.transform([args]))[0])
+        except Exception:
+            return None
+        return cluster_dists[cluster].expected_remaining(elapsed_s)
+
+    def maybe_refit(self) -> None:
+        """Refit argument clusters for tools that accumulated enough samples.
+
+        Amortized: each tool refits only after ``_REFIT_SAMPLE_INTERVAL`` new
+        samples, keeping the engine-loop overhead negligible.
+        """
+        if not self.use_clustering:
+            return
+        for key, pending in list(self._samples_since_refit.items()):
+            samples = self._samples.get(key, [])
+            if len(samples) < _MIN_SAMPLES_FOR_CLUSTERING:
+                continue
+            if key in self._cluster_models and pending < _REFIT_SAMPLE_INTERVAL:
+                continue
+            self._refit_tool(key, samples)
+            self._samples_since_refit[key] = 0
+
+    def _refit_tool(self, key: str, samples: list[tuple[str, float]]) -> None:
+        from sklearn.cluster import MiniBatchKMeans
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        args_list = [args for args, _ in samples]
+        n_clusters = min(_NUM_CLUSTERS, len(samples))
+        try:
+            vectorizer = TfidfVectorizer(max_features=_TFIDF_MAX_FEATURES)
+            matrix = vectorizer.fit_transform(args_list)
+            kmeans = MiniBatchKMeans(n_clusters=n_clusters, n_init="auto")
+            labels = kmeans.fit_predict(matrix)
+        except ValueError:
+            # E.g. empty vocabulary when all arguments are stop words.
+            return
+        cluster_dists = [DurationDistribution() for _ in range(n_clusters)]
+        for (_, duration_s), label in zip(samples, labels):
+            cluster_dists[label].record(duration_s)
+        self._cluster_models[key] = (vectorizer, kmeans, cluster_dists)
+        logger.debug(
+            "CacheWise refit %d clusters for tool key %r over %d samples",
+            n_clusters,
+            key,
+            len(samples),
+        )
+
+    def _load_bootstrap(self, path: str) -> None:
+        if not os.path.exists(path):
+            logger.warning(
+                "CacheWise bootstrap file %s does not exist; starting cold.",
+                path,
+            )
+            return
+        num_loaded = 0
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sample = json.loads(line)
+                    tool = sample["tool"]
+                    duration_s = float(sample["duration_s"])
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    logger.warning_once(
+                        "Skipping malformed lines in CacheWise bootstrap "
+                        "file %s",
+                        path,
+                    )
+                    continue
+                args = str(sample.get("args", ""))
+                tools = [(tool, args)] if tool != HUMAN_PAUSE_KEY else []
+                self.record(tools, duration_s)
+                num_loaded += 1
+        self.maybe_refit()
+        logger.info(
+            "CacheWise predictor bootstrapped with %d samples from %s",
+            num_loaded,
+            path,
+        )
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "num_samples": self.global_dist.num_samples,
+            "num_tool_keys": len(self.tool_dists),
+            "num_clustered_tools": len(self._cluster_models),
+        }

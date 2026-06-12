@@ -37,6 +37,8 @@ MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+KVCacheEvictionPolicy = Literal["lru", "predictive"]
+CacheWisePredictor = Literal["tool_name", "tfidf_kmeans"]
 
 
 @config
@@ -176,6 +178,39 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    kv_cache_eviction_policy: KVCacheEvictionPolicy = "lru"
+    """Eviction policy for cached KV blocks under memory pressure:
+
+    - "lru" evicts the least recently used blocks (default).
+    - "predictive" evicts blocks in order of predicted time-to-next-reuse,
+      using per-session tool call metadata inferred from model outputs
+      (CacheWise). Designed for agentic workloads with long-running,
+      closed-loop sessions. Requires prefix caching."""
+    cachewise_rebuild_interval: int = Field(default=3, gt=0)
+    """Number of engine iterations between rebuilds of the predictive
+    eviction order. Smaller values give fresher reuse estimates at higher
+    CPU scheduling overhead. Only used with the "predictive" eviction
+    policy."""
+    cachewise_session_ttl: float = Field(default=1800.0, gt=0)
+    """Seconds after which a session that has not issued a new request is
+    dropped from predictive eviction tracking; its blocks fall back to LRU
+    ordering. Only used with the "predictive" eviction policy."""
+    cachewise_predictor: CacheWisePredictor = "tool_name"
+    """Predictor used to estimate session time-to-next-reuse:
+
+    - "tool_name" uses per-tool-name empirical duration distributions.
+    - "tfidf_kmeans" additionally clusters tool calls by TF-IDF embeddings
+      of their arguments (requires scikit-learn; falls back to "tool_name"
+      when unavailable)."""
+    cachewise_bootstrap_path: str | None = None
+    """Optional path to a JSONL file of historical tool duration samples
+    (objects with "tool", "args", and "duration_s" keys) used to bootstrap
+    the predictive eviction predictor before online samples accumulate."""
+    cachewise_default_reuse_s: float = Field(default=120.0, gt=0)
+    """Predicted reuse time (seconds) assigned to cached blocks without
+    session metadata, and the final fallback of the predictor chain. Only
+    used with the "predictive" eviction policy."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -206,6 +241,13 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # Eviction ordering doesn't affect the compiled graph
+            "kv_cache_eviction_policy",
+            "cachewise_rebuild_interval",
+            "cachewise_session_ttl",
+            "cachewise_predictor",
+            "cachewise_bootstrap_path",
+            "cachewise_default_reuse_s",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -241,6 +283,25 @@ class CacheConfig:
             self.user_specified_block_size = True
         if self.mamba_block_size is not None:
             self.user_specified_mamba_block_size = True
+        return self
+
+    @model_validator(mode="after")
+    def _validate_kv_cache_eviction_policy(self) -> "CacheConfig":
+        if self.kv_cache_eviction_policy != "predictive":
+            return self
+        if not self.enable_prefix_caching:
+            raise ValueError(
+                "kv_cache_eviction_policy='predictive' requires prefix "
+                "caching to be enabled."
+            )
+        if self.kv_offloading_size is not None:
+            # The native offloading manager walks the LRU free queue's
+            # internal linked list, which the predictive queue replaces.
+            raise ValueError(
+                "kv_cache_eviction_policy='predictive' is not yet "
+                "compatible with KV cache offloading "
+                "(kv_offloading_size)."
+            )
         return self
 
     @field_validator("calculate_kv_scales", mode="after")

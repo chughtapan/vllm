@@ -30,6 +30,8 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.core.cachewise import CacheWiseManager
+from vllm.v1.core.cachewise.manager import supports_predictive_eviction
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -230,6 +232,20 @@ class Scheduler(SchedulerInterface):
                 # for the last sampled token plus queries for each draft token.
                 self.num_lookahead_tokens = self.num_spec_tokens + 1
 
+        # CacheWise predictive KV cache eviction (opt-in).
+        self.cachewise: CacheWiseManager | None = None
+        free_block_queue_factory = None
+        if self.cache_config.kv_cache_eviction_policy == "predictive":
+            if supports_predictive_eviction(kv_cache_config):
+                self.cachewise = CacheWiseManager(vllm_config)
+                free_block_queue_factory = self.cachewise.create_free_queue
+            else:
+                logger.warning(
+                    "kv_cache_eviction_policy='predictive' only supports "
+                    "models with a single full-attention KV cache group; "
+                    "falling back to LRU eviction."
+                )
+
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
@@ -247,6 +263,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            free_block_queue_factory=free_block_queue_factory,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -356,6 +373,8 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
+        if self.cachewise is not None:
+            self.cachewise.step(self.current_step)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -867,6 +886,8 @@ class Scheduler(SchedulerInterface):
                         )
 
                 request = request_queue.pop_request()
+                if self.cachewise is not None:
+                    self.cachewise.on_request_scheduled(request)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1046,6 +1067,10 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if self.cachewise is not None:
+            self.cachewise.on_request_preempted(
+                request, self._cachewise_block_ids(request)
+            )
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1975,8 +2000,31 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        if self.cachewise is not None:
+            self.cachewise.on_request_finished(
+                request, self._cachewise_block_ids(request)
+            )
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+
+    def _cachewise_block_ids(self, request: Request) -> list[int]:
+        """Block ids of a request's (single-group) KV cache blocks."""
+        blocks = self.kv_cache_manager.get_blocks(request.request_id)
+        return [block.block_id for block in blocks.blocks[0]]
+
+    def cachewise_report_tool_calls(
+        self,
+        request_id: str,
+        tool_calls: list[tuple[str, str]],
+        finish_ts: float,
+    ) -> None:
+        """Attach tool calls parsed by the API layer to a finished request."""
+        if self.cachewise is not None:
+            self.cachewise.report_tool_calls(
+                request_id,
+                [(name, args) for name, args in tool_calls],
+                finish_ts,
+            )
 
     @property
     def pause_state(self) -> PauseState:
@@ -2046,6 +2094,8 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if reset_successful and self.cachewise is not None:
+            self.cachewise.on_reset_prefix_cache()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
