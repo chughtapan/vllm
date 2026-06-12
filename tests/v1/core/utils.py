@@ -58,6 +58,8 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    scheduling_policy: str = "fcfs",
+    kv_cache_eviction_policy: str = "lru",
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -90,6 +92,7 @@ def create_scheduler(
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
+        policy=scheduling_policy,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
     )
@@ -99,6 +102,7 @@ def create_scheduler(
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
+        kv_cache_eviction_policy=kv_cache_eviction_policy,
     )
     kv_transfer_config = None
     if isinstance(use_kv_connector, MockKVConfig):

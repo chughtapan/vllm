@@ -2,15 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -123,6 +124,8 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        free_block_queue_factory: Callable[[list[KVCacheBlock]], FreeKVCacheBlockQueue]
+        | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -152,6 +155,7 @@ class KVCacheManager:
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            free_block_queue_factory=free_block_queue_factory,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -199,12 +203,17 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(
+        self, request: Request, record_stats: bool = True
+    ) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
+            record_stats: Whether to record prefix cache stats. Set to False
+                for read-only queries (e.g. prefix-aware scheduling scores)
+                that don't lead to an allocation.
 
         Returns:
             A tuple containing:
@@ -231,7 +240,7 @@ class KVCacheManager:
             )
         )
 
-        if self.log_stats:
+        if record_stats and self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,
@@ -240,6 +249,20 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def estimate_num_new_blocks(self, request: Request) -> int:
+        """Estimate how many new blocks scheduling this request would need.
+
+        Used by prefix-aware scheduling to rank waiting requests by prefix
+        cache overlap; does not record prefix cache stats.
+        """
+        num_computed_tokens = request.num_computed_tokens
+        if num_computed_tokens == 0:
+            _, num_computed_tokens = self.get_computed_blocks(
+                request, record_stats=False
+            )
+        num_new_tokens = request.num_tokens - num_computed_tokens
+        return cdiv(num_new_tokens, self.coordinator.scheduler_block_size)
 
     def allocate_slots(
         self,

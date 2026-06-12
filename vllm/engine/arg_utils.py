@@ -66,6 +66,8 @@ from vllm.config import (
 )
 from vllm.config.cache import (
     CacheDType,
+    CacheWisePredictor,
+    KVCacheEvictionPolicy,
     KVOffloadingBackend,
     MambaCacheMode,
     MambaDType,
@@ -640,6 +642,8 @@ class EngineArgs:
     )
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+    prefix_aware_max_wait_s: float = SchedulerConfig.prefix_aware_max_wait_s
+    prefix_aware_max_candidates: int = SchedulerConfig.prefix_aware_max_candidates
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
@@ -706,6 +710,14 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    kv_cache_eviction_policy: KVCacheEvictionPolicy = (
+        CacheConfig.kv_cache_eviction_policy
+    )
+    cachewise_rebuild_interval: int = CacheConfig.cachewise_rebuild_interval
+    cachewise_session_ttl: float = CacheConfig.cachewise_session_ttl
+    cachewise_predictor: CacheWisePredictor = CacheConfig.cachewise_predictor
+    cachewise_bootstrap_path: str | None = CacheConfig.cachewise_bootstrap_path
+    cachewise_default_reuse_s: float = CacheConfig.cachewise_default_reuse_s
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1171,6 +1183,26 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
+        cache_group.add_argument(
+            "--kv-cache-eviction-policy", **cache_kwargs["kv_cache_eviction_policy"]
+        )
+        cache_group.add_argument(
+            "--cachewise-rebuild-interval",
+            **cache_kwargs["cachewise_rebuild_interval"],
+        )
+        cache_group.add_argument(
+            "--cachewise-session-ttl", **cache_kwargs["cachewise_session_ttl"]
+        )
+        cache_group.add_argument(
+            "--cachewise-predictor", **cache_kwargs["cachewise_predictor"]
+        )
+        cache_group.add_argument(
+            "--cachewise-bootstrap-path", **cache_kwargs["cachewise_bootstrap_path"]
+        )
+        cache_group.add_argument(
+            "--cachewise-default-reuse-s",
+            **cache_kwargs["cachewise_default_reuse_s"],
+        )
 
         # Model weight offload related configs
         offload_kwargs = get_kwargs(OffloadConfig)
@@ -1394,6 +1426,14 @@ class EngineArgs:
         # are no longer supported.
         scheduler_group.add_argument(
             "--scheduling-policy", **scheduler_kwargs["policy"]
+        )
+        scheduler_group.add_argument(
+            "--prefix-aware-max-wait-s",
+            **scheduler_kwargs["prefix_aware_max_wait_s"],
+        )
+        scheduler_group.add_argument(
+            "--prefix-aware-max-candidates",
+            **scheduler_kwargs["prefix_aware_max_candidates"],
         )
         scheduler_group.add_argument(
             "--enable-chunked-prefill",
@@ -1792,6 +1832,12 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            kv_cache_eviction_policy=self.kv_cache_eviction_policy,
+            cachewise_rebuild_interval=self.cachewise_rebuild_interval,
+            cachewise_session_ttl=self.cachewise_session_ttl,
+            cachewise_predictor=self.cachewise_predictor,
+            cachewise_bootstrap_path=self.cachewise_bootstrap_path,
+            cachewise_default_reuse_s=self.cachewise_default_reuse_s,
         )
 
         if resolved_cache_dtype.startswith("turboquant_"):
@@ -2058,6 +2104,8 @@ class EngineArgs:
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
+            prefix_aware_max_wait_s=self.prefix_aware_max_wait_s,
+            prefix_aware_max_candidates=self.prefix_aware_max_candidates,
             scheduler_cls=self.scheduler_cls,
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,

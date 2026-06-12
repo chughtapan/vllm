@@ -160,6 +160,18 @@ class EngineClient(ABC):
         """Reset the prefix cache and optionally any configured connector cache"""
         ...
 
+    async def cachewise_report_tool_calls(
+        self,
+        request_id: str,
+        tool_calls: list[tuple[str, str]],
+    ) -> None:
+        """Report tool calls parsed from a finished request's output.
+
+        Used by CacheWise predictive KV cache eviction; a no-op for engine
+        clients that do not support it.
+        """
+        return None
+
     @abstractmethod
     async def sleep(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
         """Sleep the engine"""

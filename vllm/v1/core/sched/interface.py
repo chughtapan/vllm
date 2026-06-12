@@ -197,6 +197,18 @@ class SchedulerInterface(ABC):
     def set_pause_state(self, pause_state: PauseState) -> None:
         raise NotImplementedError
 
+    def cachewise_report_tool_calls(
+        self,
+        request_id: str,
+        tool_calls: list[tuple[str, str]],
+    ) -> None:
+        """Attach tool calls parsed by the API layer to a finished request.
+
+        Used by CacheWise predictive KV cache eviction; a no-op for
+        schedulers that do not support it.
+        """
+        return None
+
     @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

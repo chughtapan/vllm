@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 from vllm import envs
@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
     BlockHashListWithBlockSize,
+    FreeKVCacheBlockQueue,
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -75,6 +76,8 @@ class KVCacheCoordinator(ABC):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        free_block_queue_factory: Callable[[list[KVCacheBlock]], FreeKVCacheBlockQueue]
+        | None = None,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -93,6 +96,7 @@ class KVCacheCoordinator(ABC):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            free_block_queue_factory=free_block_queue_factory,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -396,6 +400,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        free_block_queue_factory: Callable[[list[KVCacheBlock]], FreeKVCacheBlockQueue]
+        | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -409,6 +415,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            free_block_queue_factory=free_block_queue_factory,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -743,7 +750,15 @@ def get_kv_cache_coordinator(
     scheduler_block_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    free_block_queue_factory: Callable[[list[KVCacheBlock]], FreeKVCacheBlockQueue]
+    | None = None,
 ) -> KVCacheCoordinator:
+    assert free_block_queue_factory is None or (
+        enable_caching and len(kv_cache_config.kv_cache_groups) == 1
+    ), (
+        "A custom free block queue is only supported with prefix caching "
+        "and a single KV cache group."
+    )
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,
@@ -770,6 +785,7 @@ def get_kv_cache_coordinator(
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            free_block_queue_factory=free_block_queue_factory,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,

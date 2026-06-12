@@ -534,6 +534,11 @@ def has_mori() -> bool:
     return _has_module("mori")
 
 
+def has_sklearn() -> bool:
+    """Whether the optional `scikit-learn` package is available."""
+    return _has_module("sklearn")
+
+
 def has_fbgemm_gpu() -> bool:
     """Whether the optional `fbgemm_gpu` package is available."""
     return _has_module("fbgemm_gpu")
