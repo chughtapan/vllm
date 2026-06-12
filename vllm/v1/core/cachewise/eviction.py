@@ -99,7 +99,11 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
                     self._on_evicted_fn(block.block_id, segment_id)
             ret.extend(popped)
             remaining -= take
-        self.num_free_blocks -= n
+        # Decrement by what was actually popped, not the request size, so a
+        # segment/aggregate accounting mismatch surfaces here instead of
+        # silently desyncing num_free_blocks.
+        assert remaining == 0, "free block accounting desync"
+        self.num_free_blocks -= len(ret)
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:

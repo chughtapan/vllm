@@ -36,6 +36,12 @@ PREEMPTED_SESSION_ID = -1
 # from the API layer.
 _TOOL_REPORT_WINDOW_S = 60.0
 
+# Caps on client-influenced tool metadata (from hints or parsed model output),
+# bounding the memory a single request can attach to shared engine state.
+_MAX_TOOLS_PER_TURN = 32
+_MAX_TOOL_NAME_LEN = 128
+_MAX_TOOL_ARGS_LEN = 4096
+
 ToolCalls = list[tuple[str, str]]
 
 
@@ -116,9 +122,13 @@ class SessionTracker:
         and attaches tool metadata from a client hint when present; otherwise
         the session awaits a tool report from the API layer.
         """
+        request_id = request.request_id
+        # Always clear any preemption tags for this request: if it was
+        # preempted and then aborted (rather than rescheduled), its blocks
+        # would otherwise stay pinned at PREEMPTED priority forever.
+        self._clear_preempted(request_id)
         if not request.block_hashes:
             return
-        request_id = request.request_id
         tail_hash = request.block_hashes[-1]
         session_id = self.by_request_id.pop(request_id, None)
         if session_id is not None and session_id in self.sessions:
@@ -286,7 +296,11 @@ class SessionTracker:
         try:
             entries = json.loads(raw) if isinstance(raw, str) else raw
             return [
-                (str(entry["name"]), str(entry.get("args", ""))) for entry in entries
+                (
+                    str(entry["name"])[:_MAX_TOOL_NAME_LEN],
+                    str(entry.get("args", ""))[:_MAX_TOOL_ARGS_LEN],
+                )
+                for entry in entries[:_MAX_TOOLS_PER_TURN]
             ]
         except (json.JSONDecodeError, KeyError, TypeError):
             logger.warning_once(

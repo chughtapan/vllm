@@ -6,11 +6,22 @@ import json
 
 import pytest
 
+from vllm.v1.core.cachewise import predictor as predictor_mod
 from vllm.v1.core.cachewise.predictor import (
     HUMAN_PAUSE_KEY,
     DurationDistribution,
     ToolReusePredictor,
 )
+
+
+def test_tool_key_cardinality_is_capped(monkeypatch):
+    monkeypatch.setattr(predictor_mod, "_MAX_TOOL_KEYS", 8)
+    predictor = ToolReusePredictor(default_reuse_s=10.0)
+    for i in range(100):
+        predictor.record([(f"tool_{i}", "")], 5.0)
+    assert len(predictor.tool_dists) <= 8
+    # Global distribution still absorbed every sample.
+    assert predictor.global_dist.num_samples == 100
 
 
 def test_empty_distribution_returns_none():

@@ -175,6 +175,31 @@ def test_preempted_blocks_pseudo_session():
     assert tracker.classify_block(5) is None
 
 
+def test_preempted_then_aborted_clears_tag():
+    # A preempted request that finishes (aborts) instead of rescheduling must
+    # not leave its blocks pinned at PREEMPTED priority forever.
+    tracker, _, clock = make_tracker()
+    req = make_request("r1", hashes("a"))
+    tracker.on_request_preempted(req, block_ids=[5, 6])
+    assert tracker.classify_block(5) == PREEMPTED_SESSION_ID
+    tracker.on_request_finished(req, block_ids=[7])
+    assert tracker.classify_block(5) is None
+    assert PREEMPTED_SESSION_ID not in tracker.priorities(clock.now)
+
+
+def test_hint_size_is_capped():
+    tracker, _, _ = make_tracker()
+    big_hint = [{"name": "x" * 9999, "args": "y" * 99999} for _ in range(1000)]
+    req = make_request("r1", hashes("a"), hint=big_hint)
+    tracker.on_request_finished(req, block_ids=[1])
+    session = next(iter(tracker.sessions.values()))
+    assert session.pending_tools is not None
+    assert len(session.pending_tools) <= 32
+    name, args = session.pending_tools[0]
+    assert len(name) <= 128
+    assert len(args) <= 4096
+
+
 def test_ttl_prunes_idle_sessions():
     tracker, _, clock = make_tracker(ttl=100.0)
     tracker.on_request_finished(make_request("r1", hashes("a")), block_ids=[1])

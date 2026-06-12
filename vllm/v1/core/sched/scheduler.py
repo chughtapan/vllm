@@ -168,6 +168,15 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        if (
+            self.policy == SchedulingPolicy.PREFIX_AWARE
+            and not self.cache_config.enable_prefix_caching
+        ):
+            logger.warning(
+                "scheduling_policy='prefix_aware' has no effect without prefix "
+                "caching: every request scores zero overlap, degenerating to "
+                "shortest-prompt-first. Enable prefix caching or use 'fcfs'."
+            )
         # Priority queues for requests.
         self.waiting = self._create_request_queue()
         # requests skipped in waiting flow due async deps or constraints.

@@ -219,7 +219,7 @@ def test_popleft_n_spans_segments():
 def test_reset_demotes_everything_to_unhashed():
     blocks = make_blocks(4)
     owners = {0: 1, 1: 1}
-    queue, _ = make_queue(blocks, owners, {1: 50.0})
+    queue, evicted = make_queue(blocks, owners, {1: 50.0})
     popped = queue.popleft_n(4)
     for block in popped:
         set_hash(block)
@@ -227,8 +227,12 @@ def test_reset_demotes_everything_to_unhashed():
     queue.reset()
     assert queue.num_free_blocks == 4
     assert len(queue.get_all_free_blocks()) == 4
-    # No session callbacks fire after a reset.
+    # After a reset everything is unhashed, so popping fires no session
+    # eviction callbacks and counts no predictive evictions.
+    evicted.clear()
     queue.popleft_n(4)
+    assert evicted == []
+    assert queue.num_predictive_evictions == 0
 
 
 def test_get_all_free_blocks_eviction_order():

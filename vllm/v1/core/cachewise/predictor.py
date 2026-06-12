@@ -5,7 +5,7 @@
 import json
 import math
 import os
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Sequence
 
 from vllm.logger import init_logger
@@ -32,6 +32,10 @@ _REFIT_SAMPLE_INTERVAL = 256
 # Refits run inline on the engine loop; bounding the per-tool sample buffer
 # keeps each refit's cost and memory constant.
 _MAX_SAMPLES_PER_KEY = 2048
+# Cap on distinct tool keys retained; tool names are client-influenced, so an
+# unbounded key space would be a memory-exhaustion vector. Evicted keys fall
+# back to the global distribution.
+_MAX_TOOL_KEYS = 4096
 _NUM_CLUSTERS = 8
 _TFIDF_MAX_FEATURES = 512
 
@@ -108,7 +112,9 @@ class ToolReusePredictor:
     ) -> None:
         self.default_reuse_s = default_reuse_s
         self.global_dist = DurationDistribution()
-        self.tool_dists: dict[str, DurationDistribution] = {}
+        # LRU-bounded so a client minting unique tool names cannot grow
+        # per-key state without limit; evicted keys fall back to global_dist.
+        self.tool_dists: OrderedDict[str, DurationDistribution] = OrderedDict()
 
         self.use_clustering = use_clustering and has_sklearn()
         if use_clustering and not self.use_clustering:
@@ -144,6 +150,8 @@ class ToolReusePredictor:
         dist = self.tool_dists.get(key)
         if dist is None:
             dist = self.tool_dists[key] = DurationDistribution()
+        else:
+            self.tool_dists.move_to_end(key)
         dist.record(duration_s)
         self.global_dist.record(duration_s)
         if self.use_clustering and key != HUMAN_PAUSE_KEY:
@@ -153,6 +161,15 @@ class ToolReusePredictor:
                 samples = self._samples[key] = deque(maxlen=_MAX_SAMPLES_PER_KEY)
             samples.append((args, duration_s))
             self._samples_since_refit[key] = self._samples_since_refit.get(key, 0) + 1
+        self._evict_keys_over_cap()
+
+    def _evict_keys_over_cap(self) -> None:
+        """Drop least-recently-recorded tool keys past the cardinality cap."""
+        while len(self.tool_dists) > _MAX_TOOL_KEYS:
+            evicted, _ = self.tool_dists.popitem(last=False)
+            self._samples.pop(evicted, None)
+            self._samples_since_refit.pop(evicted, None)
+            self._cluster_models.pop(evicted, None)
 
     def predict_remaining(
         self, tools: list[tuple[str, str]], elapsed_s: float
@@ -213,7 +230,9 @@ class ToolReusePredictor:
         try:
             vectorizer = TfidfVectorizer(max_features=_TFIDF_MAX_FEATURES)
             matrix = vectorizer.fit_transform(args_list)
-            kmeans = MiniBatchKMeans(n_clusters=n_clusters, n_init="auto")
+            kmeans = MiniBatchKMeans(
+                n_clusters=n_clusters, n_init="auto", random_state=0
+            )
             labels = kmeans.fit_predict(matrix)
         except ValueError:
             # E.g. empty vocabulary when all arguments are stop words.

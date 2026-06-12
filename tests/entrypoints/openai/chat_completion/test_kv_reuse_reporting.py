@@ -69,4 +69,12 @@ async def test_reporting_errors_do_not_propagate():
     serving._report_kv_reuse_tool_calls(
         "req-1", num_choices=1, tool_calls=[("Bash", "x")]
     )
-    await asyncio.gather(*serving._kv_reuse_report_tasks, return_exceptions=True)
+    # The done-callback consumes the exception and drops the task from the set;
+    # nothing propagates to the caller and no task is left dangling.
+    (task,) = serving._kv_reuse_report_tasks
+    # First yield runs the task to completion; second lets its done-callback
+    # (scheduled via call_soon) consume the exception and drop the task.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert task.exception() is not None
+    assert not serving._kv_reuse_report_tasks

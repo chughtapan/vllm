@@ -196,8 +196,15 @@ class OpenAIServingChat(OpenAIServing):
         task = asyncio.create_task(
             self.engine_client.cachewise_report_tool_calls(request_id, tool_calls)
         )
-        task.add_done_callback(self._kv_reuse_report_tasks.discard)
+        task.add_done_callback(self._on_kv_reuse_report_done)
         self._kv_reuse_report_tasks.add(task)
+
+    def _on_kv_reuse_report_done(self, task: asyncio.Task) -> None:
+        self._kv_reuse_report_tasks.discard(task)
+        # Consume any exception so a failed best-effort report degrades
+        # quietly instead of surfacing as "Task exception was never retrieved".
+        if not task.cancelled() and task.exception() is not None:
+            logger.debug("KV reuse tool-call report failed", exc_info=task.exception())
 
     def _effective_chat_template_kwargs(
         self, request: ChatCompletionRequest
@@ -618,7 +625,9 @@ class OpenAIServingChat(OpenAIServing):
                         if delta_message is not None:
                             if delta_message.tool_calls:
                                 tools_streamed[i] = True
-                                if self.enable_kv_reuse_reporting:
+                                # n > 1 reports are dropped downstream, so only
+                                # accumulate for single-choice requests.
+                                if self.enable_kv_reuse_reporting and num_choices == 1:
                                     parts = streamed_tool_call_parts[i]
                                     for tc in delta_message.tool_calls:
                                         if tc.function is None:
@@ -877,6 +886,9 @@ class OpenAIServingChat(OpenAIServing):
             history_tool_call_cnt = 0
 
         role = self.get_chat_request_role(request)
+        # Tool calls of the first choice, captured for KV reuse reporting
+        # (reporting is skipped for n > 1, so the first choice is the request).
+        reported_tool_calls: list[tuple[str, str]] = []
         for output in final_res.outputs:
             # check for error finish reason and raise GenerationError
             # finish_reason='error' indicates a retryable request-level internal error
@@ -1053,10 +1065,15 @@ class OpenAIServingChat(OpenAIServing):
 
             choices.append(choice_data)
 
+            if output.index == 0:
+                reported_tool_calls = [
+                    (tc.name, tc.arguments or "") for tc in (tool_calls or [])
+                ]
+
         self._report_kv_reuse_tool_calls(
             request_id,
             num_choices=len(final_res.outputs),
-            tool_calls=[(tc.name, tc.arguments or "") for tc in (tool_calls or [])],
+            tool_calls=reported_tool_calls,
         )
 
         if request.echo:
