@@ -139,6 +139,17 @@ class OpenAIServingChat(OpenAIServing):
 
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
 
+        # CacheWise predictive KV cache eviction: report tool calls parsed
+        # from finished generations back to the engine so it can predict
+        # when the agent session will return.
+        vllm_config = getattr(engine_client, "vllm_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
+        self.enable_kv_reuse_reporting = (
+            getattr(cache_config, "kv_cache_eviction_policy", "lru")
+            == "predictive"
+        )
+        self._kv_reuse_report_tasks: set[asyncio.Task] = set()
+
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
@@ -168,6 +179,31 @@ class OpenAIServingChat(OpenAIServing):
                 chat_template_kwargs=self.default_chat_template_kwargs,
             )
         )
+
+    def _report_kv_reuse_tool_calls(
+        self,
+        request_id: str,
+        num_choices: int,
+        tool_calls: list[tuple[str, str]],
+    ) -> None:
+        """Report a finished request's tool calls to the engine.
+
+        Fire-and-forget: reporting feeds the engine's KV reuse predictions
+        and must never delay or break the response path. Multi-choice
+        (n > 1) requests are skipped since their engine request ids differ.
+        """
+        if not self.enable_kv_reuse_reporting or num_choices > 1:
+            return
+        try:
+            task = asyncio.create_task(
+                self.engine_client.cachewise_report_tool_calls(
+                    request_id, tool_calls, time.time()
+                )
+            )
+            task.add_done_callback(self._kv_reuse_report_tasks.discard)
+            self._kv_reuse_report_tasks.add(task)
+        except Exception:
+            logger.warning_once("Failed to report tool calls for KV reuse.")
 
     def _effective_chat_template_kwargs(
         self, request: ChatCompletionRequest
@@ -401,6 +437,11 @@ class OpenAIServingChat(OpenAIServing):
         num_prompt_tokens = 0
         num_cached_tokens = None
         tools_streamed = [False] * num_choices
+        # Per-choice tool calls accumulated from deltas for KV reuse
+        # reporting: tool index -> [name, concatenated arguments].
+        streamed_tool_call_parts: list[dict[int, list[str]]] = [
+            {} for _ in range(num_choices)
+        ]
 
         if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
             tool_choice_function_name = request.tool_choice.function.name
@@ -583,6 +624,18 @@ class OpenAIServingChat(OpenAIServing):
                         if delta_message is not None:
                             if delta_message.tool_calls:
                                 tools_streamed[i] = True
+                                if self.enable_kv_reuse_reporting:
+                                    parts = streamed_tool_call_parts[i]
+                                    for tc in delta_message.tool_calls:
+                                        part = parts.setdefault(
+                                            tc.index, ["", ""]
+                                        )
+                                        if tc.function is None:
+                                            continue
+                                        if tc.function.name:
+                                            part[0] = tc.function.name
+                                        if tc.function.arguments:
+                                            part[1] += tc.function.arguments
 
                             if (
                                 delta_message.reasoning
@@ -691,6 +744,17 @@ class OpenAIServingChat(OpenAIServing):
                         )
 
                         finish_reason_sent[i] = True
+
+                        parts = streamed_tool_call_parts[i]
+                        self._report_kv_reuse_tool_calls(
+                            request_id,
+                            num_choices=num_choices,
+                            tool_calls=[
+                                (parts[idx][0], parts[idx][1])
+                                for idx in sorted(parts)
+                                if parts[idx][0]
+                            ],
+                        )
 
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
                     chunk = ChatCompletionStreamResponse(
@@ -995,6 +1059,14 @@ class OpenAIServingChat(OpenAIServing):
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 
             choices.append(choice_data)
+
+        self._report_kv_reuse_tool_calls(
+            request_id,
+            num_choices=len(final_res.outputs),
+            tool_calls=[
+                (tc.name, tc.arguments or "") for tc in (tool_calls or [])
+            ],
+        )
 
         if request.echo:
             last_msg_content: str | list[dict[str, str]] = ""

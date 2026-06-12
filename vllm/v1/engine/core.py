@@ -651,6 +651,24 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def cachewise_report_tool_calls(
+        self,
+        request_id: str,
+        tool_calls: list[tuple[str, str]],
+        finish_ts: float,
+    ) -> None:
+        """Attach tool calls parsed by the API layer to a finished request.
+
+        Used by CacheWise predictive KV cache eviction to estimate when the
+        agent session will issue its next request.
+        """
+        # Tuples become lists after msgspec serialization.
+        self.scheduler.cachewise_report_tool_calls(
+            request_id,
+            [(name, args) for name, args in tool_calls],
+            finish_ts,
+        )
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 
