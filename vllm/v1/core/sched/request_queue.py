@@ -291,10 +291,11 @@ class PrefixAwareRequestQueue(RequestQueue):
         self._requests.move_to_end(request.request_id, last=False)
 
     def prepend_requests(self, requests: RequestQueue) -> None:
-        # Prepend in reverse so the donor queue's order is preserved at the
-        # front (matches FCFSRequestQueue.extendleft semantics).
+        # Iterate forward, moving each to the front, so the donor's order is
+        # reversed at the head -- matching FCFSRequestQueue.extendleft, which
+        # the scheduler relies on when requeuing skipped requests.
         self._selected = None
-        for request in reversed(list(requests)):
+        for request in requests:
             self._requests[request.request_id] = request
             self._requests.move_to_end(request.request_id, last=False)
 

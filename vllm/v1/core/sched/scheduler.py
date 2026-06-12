@@ -2226,6 +2226,9 @@ class Scheduler(SchedulerInterface):
         if self.ec_connector is not None:
             self.ec_connector.shutdown()
 
+        if self.cachewise is not None:
+            self.cachewise.shutdown()
+
         logger.debug_once("[shutdown] Scheduler: complete")
 
     ########################################################################

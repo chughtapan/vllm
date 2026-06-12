@@ -14,6 +14,30 @@ from vllm.v1.core.cachewise.predictor import (
 )
 
 
+def test_refit_counter_not_reset_when_busy():
+    pytest.importorskip("sklearn")
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    release = threading.Event()
+    executor.submit(release.wait)  # occupy the worker
+    predictor = ToolReusePredictor(
+        default_reuse_s=10.0, use_clustering=True, refit_executor=executor
+    )
+    for _ in range(120):
+        predictor.record([("Bash", "x")], 1.0)
+    predictor.maybe_refit()  # first call submits (queued behind blocker)
+    assert "Bash" in predictor._inflight_refits
+    # A second refit attempt while busy must NOT zero the sample counter,
+    # so the freshly accumulated samples aren't silently discarded.
+    predictor._samples_since_refit["Bash"] = 300
+    predictor.maybe_refit()
+    assert predictor._samples_since_refit["Bash"] == 300
+    release.set()
+    executor.shutdown(wait=True)
+
+
 def test_tool_key_cardinality_is_capped(monkeypatch):
     monkeypatch.setattr(predictor_mod, "_MAX_TOOL_KEYS", 8)
     predictor = ToolReusePredictor(default_reuse_s=10.0)

@@ -121,3 +121,9 @@ class CacheWiseManager:
         if self.queue is not None:
             stats["num_predictive_evictions"] = self.queue.num_predictive_evictions
         return stats
+
+    def shutdown(self) -> None:
+        """Stop the background refit thread, dropping any queued fits."""
+        if self._refit_executor is not None:
+            self._refit_executor.shutdown(wait=False, cancel_futures=True)
+            self._refit_executor = None

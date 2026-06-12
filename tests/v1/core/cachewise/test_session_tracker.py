@@ -217,6 +217,21 @@ def test_in_flight_sessions_survive_cap(monkeypatch):
     assert kept_sid in tracker.sessions
 
 
+def test_dropping_session_keeps_colliding_live_mapping(monkeypatch):
+    # Two sessions end on the same tail hash; the newer owns the mapping.
+    # Dropping the older one (via the cap) must not erase the live mapping.
+    monkeypatch.setattr("vllm.v1.core.cachewise.session_tracker._MAX_SESSIONS", 1)
+    tracker, _, clock = make_tracker()
+    tracker.on_request_finished(make_request("r1", hashes("shared")), block_ids=[1])
+    sid_old = tracker.by_tail_hash[b"shared"]
+    tracker.on_request_finished(make_request("r2", hashes("shared")), block_ids=[2])
+    sid_new = tracker.by_tail_hash[b"shared"]
+    assert sid_new != sid_old
+    # The cap (1) dropped the older session; the live mapping survives.
+    assert sid_old not in tracker.sessions
+    assert tracker.by_tail_hash[b"shared"] == sid_new
+
+
 def test_hint_size_is_capped():
     tracker, _, _ = make_tracker()
     big_hint = [{"name": "x" * 9999, "args": "y" * 99999} for _ in range(1000)]

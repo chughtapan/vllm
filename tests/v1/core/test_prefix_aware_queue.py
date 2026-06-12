@@ -119,6 +119,20 @@ def test_prepended_requests_are_candidates():
     assert queue.pop_request().request_id == "preempted"
 
 
+def test_prepend_requests_matches_fcfs_extendleft_order():
+    # FCFS extendleft reverses the donor at the head; the OrderedDict queue
+    # must match so requeued skipped requests keep the same scan order.
+    from vllm.v1.core.sched.request_queue import FCFSRequestQueue
+
+    donor = FCFSRequestQueue()
+    for rid in ("a", "b", "c"):
+        donor.add_request(make_request(rid))
+    queue = PrefixAwareRequestQueue(scorer=None)
+    queue.add_request(make_request("existing"))
+    queue.prepend_requests(donor)
+    assert [r.request_id for r in queue] == ["c", "b", "a", "existing"]
+
+
 def test_no_scorer_falls_back_to_fcfs():
     queue = PrefixAwareRequestQueue(scorer=None)
     queue.add_request(make_request("first"))

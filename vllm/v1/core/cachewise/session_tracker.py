@@ -348,7 +348,12 @@ class SessionTracker:
     def _drop_session(self, session: Session) -> None:
         for block_id in session.block_ids:
             self._remove_owner(block_id, session.session_id)
-        self.by_tail_hash.pop(session.tail_block_hash, None)
-        self.by_request_id.pop(session.last_request_id, None)
+        # Only remove the index entries if they still point at THIS session.
+        # On a tail-hash or request-id collision the most recent finisher owns
+        # the mapping; dropping an older session must not erase the live one.
+        if self.by_tail_hash.get(session.tail_block_hash) == session.session_id:
+            del self.by_tail_hash[session.tail_block_hash]
+        if self.by_request_id.get(session.last_request_id) == session.session_id:
+            del self.by_request_id[session.last_request_id]
         self.sessions.pop(session.session_id, None)
         self._last_priorities.pop(session.session_id, None)

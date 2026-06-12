@@ -6,6 +6,7 @@ import json
 import math
 import os
 from collections import OrderedDict, deque
+from collections.abc import Sequence
 from concurrent.futures import Executor, Future
 from functools import partial
 
@@ -227,22 +228,33 @@ class ToolReusePredictor:
                 continue
             if key in self._cluster_models and pending < _REFIT_SAMPLE_INTERVAL:
                 continue
-            self._samples_since_refit[key] = 0
-            self._submit_refit(key, list(samples))
+            # Reset the counter only when a refit is actually started; if one
+            # is already in flight for this key, leave the counter so the new
+            # samples aren't silently discarded and we retry next tick.
+            if self._submit_refit(key):
+                self._samples_since_refit[key] = 0
 
-    def _submit_refit(self, key: str, samples: list[tuple[str, float]]) -> None:
-        # Snapshot is taken by the caller so the worker never reads a deque
-        # the engine thread is mutating.
+    def _submit_refit(self, key: str) -> bool:
+        """Start a refit for ``key``. Returns whether one was started."""
+        samples = self._samples.get(key)
+        if not samples:
+            return False
         if self._refit_executor is None:
-            model = self._fit_tool(key, samples)
+            model = self._fit_tool(key, list(samples))
             if model is not None:
                 self._cluster_models[key] = model
-            return
+            return True
         if key in self._inflight_refits:
-            return
+            return False
+        # Zero-copy handoff: give the worker the accumulated deque and install
+        # a fresh one, so the 2048-sample snapshot never happens on the engine
+        # thread and the worker reads a buffer nothing else mutates.
         self._inflight_refits.add(key)
-        future = self._refit_executor.submit(self._fit_tool, key, samples)
+        batch = self._samples[key]
+        self._samples[key] = deque(maxlen=_MAX_SAMPLES_PER_KEY)
+        future = self._refit_executor.submit(self._fit_tool, key, batch)
         future.add_done_callback(partial(self._on_refit_done, key))
+        return True
 
     def _on_refit_done(self, key: str, future: Future) -> None:
         self._inflight_refits.discard(key)
@@ -252,11 +264,13 @@ class ToolReusePredictor:
             logger.warning_once("CacheWise cluster refit failed for %r", key)
             return
         # dict assignment is atomic under CPython; predict only reads the tuple.
-        if model is not None:
+        # Skip keys evicted from the cardinality cap while the fit ran, so a
+        # stale callback can't reinsert state past _MAX_TOOL_KEYS.
+        if model is not None and key in self.tool_dists:
             self._cluster_models[key] = model
 
     @staticmethod
-    def _fit_tool(key: str, samples: list[tuple[str, float]]) -> "tuple | None":
+    def _fit_tool(key: str, samples: "Sequence[tuple[str, float]]") -> "tuple | None":
         """Fit TF-IDF + KMeans for one tool key. Pure: returns the model
         tuple (vectorizer, kmeans, cluster distributions) or None."""
         from sklearn.cluster import MiniBatchKMeans
