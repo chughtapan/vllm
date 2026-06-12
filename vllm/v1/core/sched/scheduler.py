@@ -169,9 +169,9 @@ class Scheduler(SchedulerInterface):
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        self.waiting = self._create_request_queue()
         # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.skipped_waiting = self._create_request_queue()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -371,10 +371,33 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
 
+    def _create_request_queue(self) -> RequestQueue:
+        """Create a request queue for the configured scheduling policy."""
+        if self.policy != SchedulingPolicy.PREFIX_AWARE:
+            return create_request_queue(self.policy)
+        # Late-binds self.kv_cache_manager, which is created after the
+        # waiting queues.
+        return create_request_queue(
+            self.policy,
+            prefix_aware_scorer=(
+                lambda request: self.kv_cache_manager.estimate_num_new_blocks(
+                    request
+                )
+            ),
+            prefix_aware_max_wait_s=(
+                self.scheduler_config.prefix_aware_max_wait_s
+            ),
+            prefix_aware_max_candidates=(
+                self.scheduler_config.prefix_aware_max_candidates
+            ),
+        )
+
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
         if self.cachewise is not None:
             self.cachewise.step(self.current_step)
+        self.waiting.new_epoch()
+        self.skipped_waiting.new_epoch()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -600,7 +623,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
+            step_skipped_waiting = self._create_request_queue()
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -1757,7 +1780,7 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        if self.policy == SchedulingPolicy.FCFS:
+        if self.policy in (SchedulingPolicy.FCFS, SchedulingPolicy.PREFIX_AWARE):
             return self.skipped_waiting or self.waiting or None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.

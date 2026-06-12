@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
@@ -245,6 +246,25 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def estimate_num_new_blocks(self, request: Request) -> int:
+        """Estimate how many new blocks scheduling this request would need.
+
+        Used by prefix-aware scheduling to rank waiting requests by prefix
+        cache overlap. Read-only: unlike get_computed_blocks, it does not
+        record prefix cache stats.
+        """
+        num_computed_tokens = request.num_computed_tokens
+        if (
+            num_computed_tokens == 0
+            and self.enable_caching
+            and not request.skip_reading_prefix_cache
+        ):
+            _, num_computed_tokens = self.coordinator.find_longest_cache_hit(
+                request.block_hashes, request.num_tokens - 1
+            )
+        num_new_tokens = request.num_tokens - num_computed_tokens
+        return cdiv(num_new_tokens, self.coordinator.scheduler_block_size)
 
     def allocate_slots(
         self,
