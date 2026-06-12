@@ -151,6 +151,9 @@ class SimpleCPUOffloadScheduler:
         self._lazy_mode = lazy_offload
         # Lazy mode: use a cursor to track the last scanned block in the GPU free queue.
         self._cursor: KVCacheBlock | None = None
+        # The free queue's eviction order can be rebuilt (e.g. CacheWise
+        # predictive eviction); when its epoch changes, the cursor is stale.
+        self._cursor_epoch = 0
         if self._lazy_mode:
             self._target_free = self._estimate_lazy_target_blocks(
                 kv_cache_config,
@@ -461,28 +464,24 @@ class SimpleCPUOffloadScheduler:
         cpu_pool = self.cpu_block_pool
         num_cpu_free = cpu_pool.get_num_free_blocks()
 
-        # Validate cursor: stale if block was removed from free queue.
+        # Validate cursor: stale if the eviction order was rebuilt or the
+        # block was removed from the free queue. Re-visiting candidates
+        # after a reset is idempotent (offloaded blocks are skipped below).
+        if free_queue.eviction_epoch != self._cursor_epoch:
+            self._cursor = None
+            self._cursor_epoch = free_queue.eviction_epoch
         if self._cursor is not None and self._cursor.ref_cnt > 0:
             self._cursor = None
 
-        # Determine start node.
-        if self._cursor is None:
-            node = free_queue.fake_free_list_head.next_free_block
-        else:
-            node = self._cursor.next_free_block
-
-        tail = free_queue.fake_free_list_tail
         gpu_ids: list[int] = []
         block_hashes: list[bytes] = []
-        covered = 0
         last_visited = self._cursor
 
-        while (
-            node is not None
-            and node is not tail
-            and covered < self._target_free
-            and len(gpu_ids) < num_cpu_free
+        for covered, node in enumerate(
+            free_queue.iter_eviction_candidates(self._cursor)
         ):
+            if covered >= self._target_free or len(gpu_ids) >= num_cpu_free:
+                break
             last_visited = node
             bhash = node.block_hash
 
@@ -493,9 +492,6 @@ class SimpleCPUOffloadScheduler:
             ):
                 gpu_ids.append(node.block_id)
                 block_hashes.append(bhash)
-
-            covered += 1
-            node = node.next_free_block
 
         self._cursor = last_visited
 

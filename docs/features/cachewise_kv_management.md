@@ -77,13 +77,19 @@ client.chat.completions.create(
 )
 ```
 
+### Composing with KV cache offloading
+
+Predictive eviction composes with KV cache offloading
+(`--kv-offloading-size`): eviction candidates are exposed to offloading
+backends in predicted-reuse order, so proactive offload copies out the
+blocks whose sessions are furthest from returning first, and eviction of
+already-offloaded blocks stays cheap.
+
 ## Limitations
 
 - Predictive eviction requires prefix caching and currently supports models
   with a single full-attention KV cache group; hybrid/SWA models fall back
   to LRU with a warning.
-- Predictive eviction is not yet compatible with KV cache offloading
-  (`kv_offloading_size`).
 - Under prefix-aware scheduling, per-request `priority` is ignored, and P99
   request latency can increase: the policy optimizes end-to-end session
   completion time rather than request tail latency.

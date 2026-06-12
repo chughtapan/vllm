@@ -294,14 +294,6 @@ class CacheConfig:
                 "kv_cache_eviction_policy='predictive' requires prefix "
                 "caching to be enabled."
             )
-        if self.kv_offloading_size is not None:
-            # The native offloading manager walks the LRU free queue's
-            # internal linked list, which the predictive queue replaces.
-            raise ValueError(
-                "kv_cache_eviction_policy='predictive' is not yet "
-                "compatible with KV cache offloading "
-                "(kv_offloading_size)."
-            )
         return self
 
     @field_validator("calculate_kv_scales", mode="after")

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Predictive free-block queue for CacheWise KV cache eviction."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
 
@@ -63,6 +63,7 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
         self._priorities: dict[int, float] = {DEFAULT_SEGMENT: default_priority}
         self.num_free_blocks = len(blocks)
         self.num_predictive_evictions = 0
+        self.eviction_epoch = 0
 
     def popleft(self) -> KVCacheBlock:
         """Pop the best eviction candidate.
@@ -121,12 +122,39 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
                 ret.extend(segment.get_all_free_blocks())
         return ret
 
+    def iter_eviction_candidates(
+        self, start_after: KVCacheBlock | None = None
+    ) -> Iterator[KVCacheBlock]:
+        """Iterate free blocks in eviction order (soonest evicted first).
+
+        Walks the reclaim and unhashed segments, then the prioritized
+        segments in decreasing predicted time-to-next-reuse, so consumers
+        such as proactive KV offload copy out the furthest-reuse blocks
+        first. Resuming via ``start_after`` is only valid while
+        ``eviction_epoch`` is unchanged and the block is still free.
+        """
+        order = self._eviction_order()
+        start_index = 0
+        resume_block: KVCacheBlock | None = None
+        if start_after is not None:
+            segment_id = self._block_segment.get(start_after.block_id)
+            if segment_id is not None and segment_id in order:
+                start_index = order.index(segment_id)
+                resume_block = start_after
+        for segment_id in order[start_index:]:
+            segment = self._segments.get(segment_id)
+            if segment is None:
+                continue
+            yield from segment.iter_eviction_candidates(resume_block)
+            resume_block = None
+
     def rebuild(self, priorities: dict[int, float]) -> None:
         """Re-order session segments by fresh priority estimates.
 
         Sessions absent from ``priorities`` (pruned by the tracker) have
         their blocks merged into the default segment.
         """
+        self.eviction_epoch += 1
         for segment_id in list(self._segments):
             if segment_id in _RESERVED_SEGMENTS or segment_id in priorities:
                 continue
@@ -151,6 +179,7 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
 
     def reset(self) -> None:
         """Demote all blocks to the unhashed segment (prefix cache reset)."""
+        self.eviction_epoch += 1
         unhashed = self._segments[UNHASHED_SEGMENT]
         for segment_id in self._eviction_order():
             if segment_id == UNHASHED_SEGMENT:

@@ -187,6 +187,12 @@ class FreeKVCacheBlockQueue:
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
         self.num_free_blocks = len(blocks)
 
+        # Incremented whenever the queue's eviction order changes wholesale
+        # (never for plain LRU; predictive queues bump it on rebuild).
+        # Consumers iterating eviction candidates with a resume cursor must
+        # restart iteration when the epoch changes.
+        self.eviction_epoch = 0
+
         # Initialize doubly links of consecutive blocks
         for i in range(self.num_free_blocks):
             if i > 0:
@@ -392,6 +398,27 @@ class FreeKVCacheBlockQueue:
             ret.append(curr_block)
             curr_block = curr_block.next_free_block
         return ret
+
+    def iter_eviction_candidates(
+        self, start_after: "KVCacheBlock | None" = None
+    ) -> Iterator[KVCacheBlock]:
+        """Iterate free blocks in eviction order (soonest evicted first).
+
+        Args:
+            start_after: Resume iteration after this block. Only valid while
+                ``eviction_epoch`` is unchanged and the block is still in
+                the queue; otherwise the caller must restart from None.
+
+        The queue must not be mutated during iteration.
+        """
+        node = (
+            self.fake_free_list_head.next_free_block
+            if start_after is None
+            else start_after.next_free_block
+        )
+        while node is not None and node.next_free_block is not None:
+            yield node
+            node = node.next_free_block
 
 
 def need_extra_keys(request: Request) -> bool:

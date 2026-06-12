@@ -236,3 +236,42 @@ def test_get_all_free_blocks_eviction_order():
     queue, _ = make_queue(blocks)
     listed = [block.block_id for block in queue.get_all_free_blocks()]
     assert listed == [0, 1, 2]
+
+
+def test_iter_eviction_candidates_order_and_resume():
+    blocks = make_blocks(6)
+    owners = {0: 1, 1: 1, 2: 2, 3: 2}
+    priorities = {1: 5.0, 2: 500.0}
+    queue, _ = make_queue(blocks, owners, priorities)
+    popped = queue.popleft_n(6)
+    for block in popped[:4]:
+        set_hash(block)
+    # Session segments freed tail-first; 4 and 5 stay unhashed.
+    queue.append_n([popped[1], popped[0]])
+    queue.append_n([popped[3], popped[2]])
+    queue.append_n([popped[4], popped[5]])
+    queue.rebuild(priorities)
+
+    listed = [b.block_id for b in queue.iter_eviction_candidates()]
+    # Unhashed first, then session 2 (furthest reuse), default, session 1.
+    assert listed == [4, 5, 3, 2, 1, 0]
+
+    # Resume mid-iteration: continue after block 3 (session 2 segment).
+    resumed = [b.block_id for b in queue.iter_eviction_candidates(blocks[3])]
+    assert resumed == [2, 1, 0]
+
+    # A stale cursor (block no longer free) restarts cleanly from None.
+    gone = queue.popleft()
+    assert [b.block_id for b in queue.iter_eviction_candidates(gone)] == [
+        b.block_id for b in queue.iter_eviction_candidates()
+    ]
+
+
+def test_eviction_epoch_bumps_on_rebuild_and_reset():
+    blocks = make_blocks(2)
+    queue, _ = make_queue(blocks)
+    epoch = queue.eviction_epoch
+    queue.rebuild({})
+    assert queue.eviction_epoch == epoch + 1
+    queue.reset()
+    assert queue.eviction_epoch == epoch + 2

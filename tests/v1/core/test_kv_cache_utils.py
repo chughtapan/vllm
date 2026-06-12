@@ -248,6 +248,24 @@ def test_free_kv_cache_block_queue_initialization():
     assert queue.fake_free_list_tail.prev_free_block is block
 
 
+def test_free_kv_cache_block_queue_iter_eviction_candidates():
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    # Full iteration follows LRU (eviction) order without mutating.
+    assert [b.block_id for b in queue.iter_eviction_candidates()] == list(range(5))
+    assert queue.num_free_blocks == 5
+
+    # Resuming after a block continues from its successor.
+    assert [b.block_id for b in queue.iter_eviction_candidates(blocks[2])] == [3, 4]
+
+    # LRU order never changes wholesale: the epoch stays fixed.
+    epoch = queue.eviction_epoch
+    queue.popleft()
+    queue.append(blocks[0])
+    assert queue.eviction_epoch == epoch
+
+
 def test_free_kv_cache_block_queue_operations():
     # Create a list of KVCacheBlock objects
     blocks = [KVCacheBlock(block_id=i) for i in range(5)]
