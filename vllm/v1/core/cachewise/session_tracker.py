@@ -141,7 +141,10 @@ class SessionTracker:
         session_id = self.by_request_id.pop(request_id, None)
         if session_id is not None and session_id in self.sessions:
             session = self.sessions[session_id]
-            self.by_tail_hash.pop(session.tail_block_hash, None)
+            # Only drop the old tail mapping if it still points here: another
+            # session may have finished on the same tail and now owns it.
+            if self.by_tail_hash.get(session.tail_block_hash) == session_id:
+                del self.by_tail_hash[session.tail_block_hash]
         else:
             session = Session(
                 session_id=self._next_session_id, tail_block_hash=tail_hash

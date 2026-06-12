@@ -9,6 +9,7 @@ from collections import OrderedDict, deque
 from collections.abc import Sequence
 from concurrent.futures import Executor, Future
 from functools import partial
+from queue import Empty, Queue
 
 from vllm.logger import init_logger
 from vllm.utils.import_utils import has_sklearn
@@ -133,8 +134,11 @@ class ToolReusePredictor:
         self._cluster_models: dict[str, tuple] = {}
         # When set, cluster fits run here instead of on the calling (engine)
         # thread; keys with a fit in flight are tracked to avoid re-submitting.
+        # Worker threads hand results back via the queue; the engine thread
+        # drains it and is the sole mutator of the model/in-flight state.
         self._refit_executor = refit_executor
         self._inflight_refits: set[str] = set()
+        self._completed_refits: Queue[tuple[str, tuple | None]] = Queue()
 
         if bootstrap_path is not None:
             self._load_bootstrap(bootstrap_path)
@@ -215,13 +219,15 @@ class ToolReusePredictor:
         """Refit argument clusters for tools that accumulated enough samples.
 
         Amortized: each tool refits only after ``_REFIT_SAMPLE_INTERVAL`` new
-        samples. With an executor the fit runs off-thread and the model is
-        swapped in atomically on completion, so the scheduler loop never
-        blocks on sklearn; without one it fits synchronously (tests, simple
-        deployments).
+        samples. With an executor the fit runs off-thread; its result is
+        applied here on the engine thread (the sole mutator of
+        ``_cluster_models``/``_inflight_refits``), so the scheduler loop never
+        blocks on sklearn and there is no cross-thread dict race. Without an
+        executor it fits synchronously (tests, simple deployments).
         """
         if not self.use_clustering:
             return
+        self._apply_completed_refits()
         for key, pending in list(self._samples_since_refit.items()):
             samples = self._samples.get(key, ())
             if len(samples) < _MIN_SAMPLES_FOR_CLUSTERING:
@@ -235,37 +241,52 @@ class ToolReusePredictor:
                 self._samples_since_refit[key] = 0
 
     def _submit_refit(self, key: str) -> bool:
-        """Start a refit for ``key``. Returns whether one was started."""
-        samples = self._samples.get(key)
-        if not samples:
+        """Start a refit for ``key``. Returns whether one was started.
+
+        Either path consumes the accumulated window (installs a fresh deque),
+        so sync and async behave identically: each refit trains on the samples
+        gathered since the previous one.
+        """
+        batch = self._samples.get(key)
+        if not batch:
             return False
-        if self._refit_executor is None:
-            model = self._fit_tool(key, list(samples))
-            if model is not None:
-                self._cluster_models[key] = model
-            return True
-        if key in self._inflight_refits:
+        if self._refit_executor is not None and key in self._inflight_refits:
             return False
-        # Zero-copy handoff: give the worker the accumulated deque and install
-        # a fresh one, so the 2048-sample snapshot never happens on the engine
-        # thread and the worker reads a buffer nothing else mutates.
-        self._inflight_refits.add(key)
-        batch = self._samples[key]
+        # Hand the accumulated deque to the fit and install a fresh one. For
+        # the async path this is a zero-copy handoff to the worker thread,
+        # which reads a buffer nothing else mutates.
         self._samples[key] = deque(maxlen=_MAX_SAMPLES_PER_KEY)
+        if self._refit_executor is None:
+            self._install_model(key, self._fit_tool(key, batch))
+            return True
+        self._inflight_refits.add(key)
         future = self._refit_executor.submit(self._fit_tool, key, batch)
         future.add_done_callback(partial(self._on_refit_done, key))
         return True
 
     def _on_refit_done(self, key: str, future: Future) -> None:
-        self._inflight_refits.discard(key)
+        # Runs on the worker thread: never touch predictor state here, only
+        # hand the result back for the engine thread to apply.
         try:
             model = future.result()
         except Exception:
             logger.warning_once("CacheWise cluster refit failed for %r", key)
-            return
-        # dict assignment is atomic under CPython; predict only reads the tuple.
+            model = None
+        self._completed_refits.put((key, model))
+
+    def _apply_completed_refits(self) -> None:
+        """Apply finished background fits on the engine thread."""
+        while True:
+            try:
+                key, model = self._completed_refits.get_nowait()
+            except Empty:
+                break
+            self._inflight_refits.discard(key)
+            self._install_model(key, model)
+
+    def _install_model(self, key: str, model: "tuple | None") -> None:
         # Skip keys evicted from the cardinality cap while the fit ran, so a
-        # stale callback can't reinsert state past _MAX_TOOL_KEYS.
+        # stale result can't reinsert state past _MAX_TOOL_KEYS.
         if model is not None and key in self.tool_dists:
             self._cluster_models[key] = model
 

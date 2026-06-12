@@ -29,11 +29,16 @@ def test_refit_counter_not_reset_when_busy():
         predictor.record([("Bash", "x")], 1.0)
     predictor.maybe_refit()  # first call submits (queued behind blocker)
     assert "Bash" in predictor._inflight_refits
-    # A second refit attempt while busy must NOT zero the sample counter,
-    # so the freshly accumulated samples aren't silently discarded.
-    predictor._samples_since_refit["Bash"] = 300
+    # Accumulate a fresh window while the fit is still in flight.
+    for _ in range(120):
+        predictor.record([("Bash", "y")], 1.0)
+    counter = predictor._samples_since_refit["Bash"]
+    assert counter >= 120
+    # The submit is skipped because a fit is in flight; the counter must NOT
+    # reset, so these samples aren't silently discarded.
     predictor.maybe_refit()
-    assert predictor._samples_since_refit["Bash"] == 300
+    assert predictor._samples_since_refit["Bash"] == counter
+    assert "Bash" in predictor._inflight_refits
     release.set()
     executor.shutdown(wait=True)
 
@@ -194,6 +199,8 @@ def test_clustering_refit_runs_off_thread():
 
     release.set()
     executor.shutdown(wait=True)  # let the queued fit run and drain
-    # The done-callback swapped the model in and cleared the in-flight mark.
+    # The worker only enqueues its result; the engine thread applies it on the
+    # next maybe_refit, so model installation never races eviction.
+    predictor.maybe_refit()
     assert "Bash" in predictor._cluster_models
     assert not predictor._inflight_refits
