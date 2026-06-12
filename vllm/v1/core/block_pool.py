@@ -153,9 +153,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        free_block_queue_factory: Callable[
-            [list[KVCacheBlock]], FreeKVCacheBlockQueue
-        ]
+        free_block_queue_factory: Callable[[list[KVCacheBlock]], FreeKVCacheBlockQueue]
         | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0

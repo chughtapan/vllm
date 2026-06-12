@@ -12,7 +12,7 @@ cooperation.
 import json
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -76,9 +76,7 @@ class SessionTracker:
         self.by_request_id: dict[str, int] = {}
         # Recently finished request id -> (session id, expiry timestamp),
         # kept so tool reports arriving after blocks were freed still land.
-        self.recently_finished: OrderedDict[str, tuple[int, float]] = (
-            OrderedDict()
-        )
+        self.recently_finished: OrderedDict[str, tuple[int, float]] = OrderedDict()
         # Block id -> session ids whose recorded prefix includes the block.
         self.block_owners: dict[int, set[int]] = {}
         # Blocks freed by preemption, keyed by the preempted request id.
@@ -114,9 +112,7 @@ class SessionTracker:
         session.in_flight = True
         self.by_request_id[request_id] = session.session_id
 
-    def on_request_finished(
-        self, request: "Request", block_ids: list[int]
-    ) -> None:
+    def on_request_finished(self, request: "Request", block_ids: list[int]) -> None:
         """Called when a request finishes, before its blocks are freed.
 
         Updates (or creates) the session, records which blocks belong to it,
@@ -151,9 +147,7 @@ class SessionTracker:
         for block_id in session.block_ids - new_block_ids:
             self._remove_owner(block_id, session.session_id)
         for block_id in new_block_ids - session.block_ids:
-            self.block_owners.setdefault(block_id, set()).add(
-                session.session_id
-            )
+            self.block_owners.setdefault(block_id, set()).add(session.session_id)
         session.block_ids = new_block_ids
 
         hint_tools = self._parse_hint(request)
@@ -181,9 +175,7 @@ class SessionTracker:
         if session.last_request_id == request_id:
             session.pending_tools = tools
 
-    def on_request_preempted(
-        self, request: "Request", block_ids: list[int]
-    ) -> None:
+    def on_request_preempted(self, request: "Request", block_ids: list[int]) -> None:
         """Tag a preempted request's freed blocks as imminently reused."""
         request_id = request.request_id
         block_id_set = set(block_ids)
@@ -205,9 +197,7 @@ class SessionTracker:
             return None
         return min(
             owners,
-            key=lambda sid: self._last_priorities.get(
-                sid, self.default_reuse_s
-            ),
+            key=lambda sid: self._last_priorities.get(sid, self.default_reuse_s),
         )
 
     def session_priority(self, session_id: int) -> float:
@@ -282,7 +272,7 @@ class SessionTracker:
             "num_tracked_blocks": len(self.block_owners),
         }
 
-    def _find_session(self, block_hashes: list[bytes]) -> Session | None:
+    def _find_session(self, block_hashes: Sequence[bytes]) -> Session | None:
         for block_hash in reversed(block_hashes):
             session_id = self.by_tail_hash.get(bytes(block_hash))
             if session_id is not None:
@@ -299,13 +289,11 @@ class SessionTracker:
         try:
             entries = json.loads(raw) if isinstance(raw, str) else raw
             return [
-                (str(entry["name"]), str(entry.get("args", "")))
-                for entry in entries
+                (str(entry["name"]), str(entry.get("args", ""))) for entry in entries
             ]
         except (json.JSONDecodeError, KeyError, TypeError):
             logger.warning_once(
-                "Malformed %s hint; expected a JSON list of "
-                '{"name", "args"} objects.',
+                'Malformed %s hint; expected a JSON list of {"name", "args"} objects.',
                 NEXT_TOOLS_HINT_KEY,
             )
             return None

@@ -60,9 +60,7 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
         # Prioritized segments (default + sessions), most-distant reuse
         # first. The reclaim and unhashed segments always precede these.
         self._order: list[int] = [DEFAULT_SEGMENT]
-        self._priorities: dict[int, float] = {
-            DEFAULT_SEGMENT: default_priority
-        }
+        self._priorities: dict[int, float] = {DEFAULT_SEGMENT: default_priority}
         self.num_free_blocks = len(blocks)
         self.num_predictive_evictions = 0
 

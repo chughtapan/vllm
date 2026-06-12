@@ -240,8 +240,7 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
             return self._selected
         head = self[0]
         if self._scorer is None or (
-            self._max_wait_s > 0
-            and time.time() - head.arrival_time > self._max_wait_s
+            self._max_wait_s > 0 and time.time() - head.arrival_time > self._max_wait_s
         ):
             self._selected = head
             return head

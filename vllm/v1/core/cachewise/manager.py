@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_STATS_LOG_INTERVAL_S = 300.0
+
 
 def supports_predictive_eviction(kv_cache_config: KVCacheConfig) -> bool:
     """Predictive eviction currently supports full-attention-only models.
@@ -63,6 +65,7 @@ class CacheWiseManager:
         )
         self.queue: PredictiveFreeBlockQueue | None = None
         self._last_rebuild_step = 0
+        self._last_stats_log_ts = time_fn()
 
     def create_free_queue(
         self, blocks: list["KVCacheBlock"]
@@ -87,18 +90,17 @@ class CacheWiseManager:
         self.predictor.maybe_refit()
         if self.queue is not None:
             self.queue.rebuild(self.tracker.priorities(now))
+        if now - self._last_stats_log_ts >= _STATS_LOG_INTERVAL_S:
+            self._last_stats_log_ts = now
+            logger.info("CacheWise stats: %s", self.stats())
 
     def on_request_scheduled(self, request: "Request") -> None:
         self.tracker.on_request_scheduled(request)
 
-    def on_request_finished(
-        self, request: "Request", block_ids: list[int]
-    ) -> None:
+    def on_request_finished(self, request: "Request", block_ids: list[int]) -> None:
         self.tracker.on_request_finished(request, block_ids)
 
-    def on_request_preempted(
-        self, request: "Request", block_ids: list[int]
-    ) -> None:
+    def on_request_preempted(self, request: "Request", block_ids: list[int]) -> None:
         self.tracker.on_request_preempted(request, block_ids)
 
     def report_tool_calls(
@@ -114,7 +116,5 @@ class CacheWiseManager:
     def stats(self) -> dict[str, int]:
         stats = {**self.tracker.stats(), **self.predictor.stats()}
         if self.queue is not None:
-            stats["num_predictive_evictions"] = (
-                self.queue.num_predictive_evictions
-            )
+            stats["num_predictive_evictions"] = self.queue.num_predictive_evictions
         return stats

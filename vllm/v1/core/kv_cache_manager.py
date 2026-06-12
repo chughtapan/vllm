@@ -124,9 +124,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
-        free_block_queue_factory: Callable[
-            [list[KVCacheBlock]], FreeKVCacheBlockQueue
-        ]
+        free_block_queue_factory: Callable[[list[KVCacheBlock]], FreeKVCacheBlockQueue]
         | None = None,
     ) -> None:
         self.max_model_len = max_model_len

@@ -151,9 +151,7 @@ class ToolReusePredictor:
         if self.use_clustering and key != HUMAN_PAUSE_KEY:
             args = " ".join(arg for _, arg in tools)
             self._samples.setdefault(key, []).append((args, duration_s))
-            self._samples_since_refit[key] = (
-                self._samples_since_refit.get(key, 0) + 1
-            )
+            self._samples_since_refit[key] = self._samples_since_refit.get(key, 0) + 1
 
     def predict_remaining(
         self, tools: list[tuple[str, str]], elapsed_s: float
@@ -249,8 +247,7 @@ class ToolReusePredictor:
                     duration_s = float(sample["duration_s"])
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     logger.warning_once(
-                        "Skipping malformed lines in CacheWise bootstrap "
-                        "file %s",
+                        "Skipping malformed lines in CacheWise bootstrap file %s",
                         path,
                     )
                     continue

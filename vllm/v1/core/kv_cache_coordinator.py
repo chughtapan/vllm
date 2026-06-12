@@ -76,9 +76,7 @@ class KVCacheCoordinator(ABC):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        free_block_queue_factory: Callable[
-            [list[KVCacheBlock]], FreeKVCacheBlockQueue
-        ]
+        free_block_queue_factory: Callable[[list[KVCacheBlock]], FreeKVCacheBlockQueue]
         | None = None,
     ):
         self.kv_cache_config = kv_cache_config
@@ -402,9 +400,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        free_block_queue_factory: Callable[
-            [list[KVCacheBlock]], FreeKVCacheBlockQueue
-        ]
+        free_block_queue_factory: Callable[[list[KVCacheBlock]], FreeKVCacheBlockQueue]
         | None = None,
     ):
         super().__init__(
@@ -754,9 +750,7 @@ def get_kv_cache_coordinator(
     scheduler_block_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
-    free_block_queue_factory: Callable[
-        [list[KVCacheBlock]], FreeKVCacheBlockQueue
-    ]
+    free_block_queue_factory: Callable[[list[KVCacheBlock]], FreeKVCacheBlockQueue]
     | None = None,
 ) -> KVCacheCoordinator:
     assert free_block_queue_factory is None or (

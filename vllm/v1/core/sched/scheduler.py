@@ -380,13 +380,9 @@ class Scheduler(SchedulerInterface):
         return create_request_queue(
             self.policy,
             prefix_aware_scorer=(
-                lambda request: self.kv_cache_manager.estimate_num_new_blocks(
-                    request
-                )
+                lambda request: self.kv_cache_manager.estimate_num_new_blocks(request)
             ),
-            prefix_aware_max_wait_s=(
-                self.scheduler_config.prefix_aware_max_wait_s
-            ),
+            prefix_aware_max_wait_s=(self.scheduler_config.prefix_aware_max_wait_s),
             prefix_aware_max_candidates=(
                 self.scheduler_config.prefix_aware_max_candidates
             ),

@@ -145,8 +145,7 @@ class OpenAIServingChat(OpenAIServing):
         vllm_config = getattr(engine_client, "vllm_config", None)
         cache_config = getattr(vllm_config, "cache_config", None)
         self.enable_kv_reuse_reporting = (
-            getattr(cache_config, "kv_cache_eviction_policy", "lru")
-            == "predictive"
+            getattr(cache_config, "kv_cache_eviction_policy", "lru") == "predictive"
         )
         self._kv_reuse_report_tasks: set[asyncio.Task] = set()
 
@@ -627,9 +626,7 @@ class OpenAIServingChat(OpenAIServing):
                                 if self.enable_kv_reuse_reporting:
                                     parts = streamed_tool_call_parts[i]
                                     for tc in delta_message.tool_calls:
-                                        part = parts.setdefault(
-                                            tc.index, ["", ""]
-                                        )
+                                        part = parts.setdefault(tc.index, ["", ""])
                                         if tc.function is None:
                                             continue
                                         if tc.function.name:
@@ -1063,9 +1060,7 @@ class OpenAIServingChat(OpenAIServing):
         self._report_kv_reuse_tool_calls(
             request_id,
             num_choices=len(final_res.outputs),
-            tool_calls=[
-                (tc.name, tc.arguments or "") for tc in (tool_calls or [])
-            ],
+            tool_calls=[(tc.name, tc.arguments or "") for tc in (tool_calls or [])],
         )
 
         if request.echo:
