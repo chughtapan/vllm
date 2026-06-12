@@ -929,11 +929,8 @@ class AsyncLLM(EngineClient):
         self,
         request_id: str,
         tool_calls: list[tuple[str, str]],
-        finish_ts: float,
     ) -> None:
-        await self.engine_core.cachewise_report_tool_calls_async(
-            request_id, tool_calls, finish_ts
-        )
+        await self.engine_core.cachewise_report_tool_calls_async(request_id, tool_calls)
 
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()

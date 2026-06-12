@@ -234,7 +234,6 @@ class EngineCoreClient(ABC):
         self,
         request_id: str,
         tool_calls: list[tuple[str, str]],
-        finish_ts: float,
     ) -> None:
         raise NotImplementedError
 
@@ -1150,10 +1149,9 @@ class AsyncMPClient(MPClient):
         self,
         request_id: str,
         tool_calls: list[tuple[str, str]],
-        finish_ts: float,
     ) -> None:
         await self.call_utility_async(
-            "cachewise_report_tool_calls", request_id, tool_calls, finish_ts
+            "cachewise_report_tool_calls", request_id, tool_calls
         )
 
     async def reset_encoder_cache_async(self) -> None:
@@ -1246,7 +1244,6 @@ class DPAsyncMPClient(AsyncMPClient):
         self,
         request_id: str,
         tool_calls: list[tuple[str, str]],
-        finish_ts: float,
     ) -> None:
         # Broadcast to all engines; only the engine that served the request
         # knows the request id, the others no-op.
@@ -1256,7 +1253,6 @@ class DPAsyncMPClient(AsyncMPClient):
                     "cachewise_report_tool_calls",
                     request_id,
                     tool_calls,
-                    finish_ts,
                     engine=engine,
                 )
                 for engine in self.core_engines

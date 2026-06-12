@@ -164,7 +164,6 @@ class EngineClient(ABC):
         self,
         request_id: str,
         tool_calls: list[tuple[str, str]],
-        finish_ts: float,
     ) -> None:
         """Report tool calls parsed from a finished request's output.
 

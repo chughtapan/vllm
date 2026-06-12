@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Predictive free-block queue for CacheWise KV cache eviction."""
 
+from bisect import insort
 from collections.abc import Callable, Iterator
 
 from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
@@ -71,24 +72,35 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
         Raises:
             ValueError: If the queue is empty.
         """
-        for segment_id in self._eviction_order():
-            segment = self._segments.get(segment_id)
-            if segment is None or segment.num_free_blocks == 0:
-                continue
-            block = segment.popleft()
-            del self._block_segment[block.block_id]
-            self.num_free_blocks -= 1
-            if segment_id not in _RESERVED_SEGMENTS:
-                self.num_predictive_evictions += 1
-                self._on_evicted_fn(block.block_id, segment_id)
-            return block
-        raise ValueError("No free blocks available")
+        blocks = self.popleft_n(1) if self.num_free_blocks else []
+        if not blocks:
+            raise ValueError("No free blocks available")
+        return blocks[0]
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
         if n == 0:
             return []
         assert self.num_free_blocks >= n
-        return [self.popleft() for _ in range(n)]
+        ret: list[KVCacheBlock] = []
+        remaining = n
+        for segment_id in self._eviction_order():
+            if remaining == 0:
+                break
+            segment = self._segments[segment_id]
+            take = min(remaining, segment.num_free_blocks)
+            if take == 0:
+                continue
+            popped = segment.popleft_n(take)
+            for block in popped:
+                del self._block_segment[block.block_id]
+            if segment_id not in _RESERVED_SEGMENTS:
+                self.num_predictive_evictions += take
+                for block in popped:
+                    self._on_evicted_fn(block.block_id, segment_id)
+            ret.extend(popped)
+            remaining -= take
+        self.num_free_blocks -= n
+        return ret
 
     def remove(self, block: KVCacheBlock) -> None:
         segment_id = self._block_segment.pop(block.block_id)
@@ -117,9 +129,7 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
         """Get all free blocks in eviction order. Mainly used for testing."""
         ret: list[KVCacheBlock] = []
         for segment_id in self._eviction_order():
-            segment = self._segments.get(segment_id)
-            if segment is not None:
-                ret.extend(segment.get_all_free_blocks())
+            ret.extend(self._segments[segment_id].get_all_free_blocks())
         return ret
 
     def iter_eviction_candidates(
@@ -142,10 +152,7 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
                 start_index = order.index(segment_id)
                 resume_block = start_after
         for segment_id in order[start_index:]:
-            segment = self._segments.get(segment_id)
-            if segment is None:
-                continue
-            yield from segment.iter_eviction_candidates(resume_block)
+            yield from self._segments[segment_id].iter_eviction_candidates(resume_block)
             resume_block = None
 
     def rebuild(self, priorities: dict[int, float]) -> None:
@@ -156,9 +163,13 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
         """
         self.eviction_epoch += 1
         for segment_id in list(self._segments):
-            if segment_id in _RESERVED_SEGMENTS or segment_id in priorities:
+            if segment_id in _RESERVED_SEGMENTS:
                 continue
-            self._merge_into_default(segment_id)
+            if segment_id not in priorities:
+                self._merge_into_default(segment_id)
+            elif self._segments[segment_id].num_free_blocks == 0:
+                # Garbage-collect empty session segments.
+                del self._segments[segment_id]
         self._priorities = {DEFAULT_SEGMENT: self._default_priority}
         for segment_id, priority in priorities.items():
             if segment_id in self._segments:
@@ -167,36 +178,18 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
             self._priorities,
             key=lambda sid: (-self._priorities[sid], sid),
         )
-        # Garbage-collect empty session segments.
-        for segment_id in list(self._segments):
-            if (
-                segment_id not in _RESERVED_SEGMENTS
-                and self._segments[segment_id].num_free_blocks == 0
-            ):
-                del self._segments[segment_id]
-                self._priorities.pop(segment_id, None)
-                self._order.remove(segment_id)
 
     def reset(self) -> None:
         """Demote all blocks to the unhashed segment (prefix cache reset)."""
         self.eviction_epoch += 1
-        unhashed = self._segments[UNHASHED_SEGMENT]
-        for segment_id in self._eviction_order():
+        for segment_id in list(self._segments):
             if segment_id == UNHASHED_SEGMENT:
                 continue
-            segment = self._segments.get(segment_id)
-            if segment is None:
-                continue
-            blocks = segment.get_all_free_blocks()
-            for block in blocks:
-                segment.remove(block)
-                unhashed.append(block)
-                self._block_segment[block.block_id] = UNHASHED_SEGMENT
-        self._segments = {
-            RECLAIM_SEGMENT: self._segments[RECLAIM_SEGMENT],
-            UNHASHED_SEGMENT: unhashed,
-            DEFAULT_SEGMENT: FreeKVCacheBlockQueue([]),
-        }
+            if segment_id in _RESERVED_SEGMENTS:
+                segment = self._segments[segment_id]
+            else:
+                segment = self._segments.pop(segment_id)
+            self._drain_into(segment, UNHASHED_SEGMENT)
         self._order = [DEFAULT_SEGMENT]
         self._priorities = {DEFAULT_SEGMENT: self._default_priority}
 
@@ -215,16 +208,9 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
         segment = self._segments.get(segment_id)
         if segment is None:
             segment = self._segments[segment_id] = FreeKVCacheBlockQueue([])
-            priority = self._priority_fn(segment_id)
-            self._priorities[segment_id] = priority
+            self._priorities[segment_id] = self._priority_fn(segment_id)
             # Keep most-distant reuse first.
-            index = 0
-            while (
-                index < len(self._order)
-                and self._priorities[self._order[index]] > priority
-            ):
-                index += 1
-            self._order.insert(index, segment_id)
+            insort(self._order, segment_id, key=lambda sid: -self._priorities[sid])
         return segment
 
     def _merge_into_default(self, segment_id: int) -> None:
@@ -232,11 +218,11 @@ class PredictiveFreeBlockQueue(FreeKVCacheBlockQueue):
         self._priorities.pop(segment_id, None)
         if segment_id in self._order:
             self._order.remove(segment_id)
-        blocks = segment.get_all_free_blocks()
-        if not blocks:
-            return
-        default = self._segments[DEFAULT_SEGMENT]
-        for block in blocks:
+        self._drain_into(segment, DEFAULT_SEGMENT)
+
+    def _drain_into(self, segment: FreeKVCacheBlockQueue, target_id: int) -> None:
+        target = self._segments[target_id]
+        for block in segment.get_all_free_blocks():
             segment.remove(block)
-            default.append(block)
-            self._block_segment[block.block_id] = DEFAULT_SEGMENT
+            target.append(block)
+            self._block_segment[block.block_id] = target_id

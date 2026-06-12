@@ -48,9 +48,6 @@ class Session:
     # None: awaiting a tool report from the API layer.
     # []: the turn ended with no tool call (human pause).
     pending_tools: ToolCalls | None = None
-    # True when pending_tools came from a client hint and must not be
-    # overwritten by a parsed tool report.
-    tools_from_hint: bool = False
     last_request_id: str = ""
     in_flight: bool = False
 
@@ -122,7 +119,7 @@ class SessionTracker:
         if not request.block_hashes:
             return
         request_id = request.request_id
-        tail_hash = bytes(request.block_hashes[-1])
+        tail_hash = request.block_hashes[-1]
         session_id = self.by_request_id.pop(request_id, None)
         if session_id is not None and session_id in self.sessions:
             session = self.sessions[session_id]
@@ -150,29 +147,24 @@ class SessionTracker:
             self.block_owners.setdefault(block_id, set()).add(session.session_id)
         session.block_ids = new_block_ids
 
+        # Client hints take precedence over parsed tool reports: hinted
+        # finishes never enter recently_finished, so a late report cannot
+        # reach them.
         hint_tools = self._parse_hint(request)
-        if hint_tools is not None:
-            session.pending_tools = hint_tools
-            session.tools_from_hint = True
-        else:
-            session.pending_tools = None
-            session.tools_from_hint = False
+        session.pending_tools = hint_tools
+        if hint_tools is None:
             self.recently_finished[request_id] = (
                 session.session_id,
                 session.last_finish_ts + _TOOL_REPORT_WINDOW_S,
             )
 
-    def on_tool_report(
-        self, request_id: str, tools: ToolCalls, finish_ts: float
-    ) -> None:
+    def on_tool_report(self, request_id: str, tools: ToolCalls) -> None:
         """Attach tool calls parsed by the API layer to a finished request."""
         entry = self.recently_finished.pop(request_id, None)
         if entry is None:
             return
         session = self.sessions.get(entry[0])
-        if session is None or session.tools_from_hint:
-            return
-        if session.last_request_id == request_id:
+        if session is not None and session.last_request_id == request_id:
             session.pending_tools = tools
 
     def on_request_preempted(self, request: "Request", block_ids: list[int]) -> None:
@@ -195,10 +187,15 @@ class SessionTracker:
         owners = self.block_owners.get(block_id)
         if not owners:
             return None
-        return min(
-            owners,
-            key=lambda sid: self._last_priorities.get(sid, self.default_reuse_s),
-        )
+        # Manual min: called per freed block, so avoid a key-closure per call.
+        priorities = self._last_priorities
+        best_sid = -1
+        best_priority = float("inf")
+        for sid in owners:
+            priority = priorities.get(sid, self.default_reuse_s)
+            if priority < best_priority:
+                best_sid, best_priority = sid, priority
+        return best_sid
 
     def session_priority(self, session_id: int) -> float:
         if session_id == PREEMPTED_SESSION_ID:
@@ -274,7 +271,7 @@ class SessionTracker:
 
     def _find_session(self, block_hashes: Sequence[bytes]) -> Session | None:
         for block_hash in reversed(block_hashes):
-            session_id = self.by_tail_hash.get(bytes(block_hash))
+            session_id = self.by_tail_hash.get(block_hash)
             if session_id is not None:
                 return self.sessions[session_id]
         return None

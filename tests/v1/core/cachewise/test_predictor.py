@@ -109,9 +109,7 @@ def test_bootstrap_missing_file():
 
 
 def test_clustering_unavailable_falls_back(monkeypatch):
-    monkeypatch.setattr(
-        ToolReusePredictor, "_sklearn_available", staticmethod(lambda: False)
-    )
+    monkeypatch.setattr("vllm.v1.core.cachewise.predictor.has_sklearn", lambda: False)
     predictor = ToolReusePredictor(default_reuse_s=10.0, use_clustering=True)
     assert not predictor.use_clustering
     predictor.record([("Bash", "x")], 5.0)

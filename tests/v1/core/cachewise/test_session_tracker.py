@@ -7,20 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.v1.core.cachewise.utils import FakeClock
 from vllm.v1.core.cachewise.predictor import ToolReusePredictor
 from vllm.v1.core.cachewise.session_tracker import (
     NEXT_TOOLS_HINT_KEY,
     PREEMPTED_SESSION_ID,
     SessionTracker,
 )
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        return self.now
 
 
 def make_tracker(default_reuse_s: float = 120.0, ttl: float = 1800.0):
@@ -58,7 +51,7 @@ def test_finish_then_return_emits_sample():
     tracker, predictor, clock = make_tracker()
     req1 = make_request("r1", hashes("a", "b"))
     tracker.on_request_finished(req1, block_ids=[10, 11])
-    tracker.on_tool_report("r1", [("Bash", "pytest")], clock.now)
+    tracker.on_tool_report("r1", [("Bash", "pytest")])
 
     # The session returns 30s later with an extended prefix.
     clock.now += 30.0
@@ -117,15 +110,16 @@ def test_hint_takes_precedence_over_report():
     tracker.on_request_finished(req, block_ids=[1])
     session = next(iter(tracker.sessions.values()))
     assert session.pending_tools == [("Bash", "sleep 60")]
-    assert session.tools_from_hint
+    # Hinted finishes never await a parsed report.
+    assert "r1" not in tracker.recently_finished
     # A later parsed report must not override the hint.
-    tracker.on_tool_report("r1", [("Read", "x")], clock.now)
+    tracker.on_tool_report("r1", [("Read", "x")])
     assert session.pending_tools == [("Bash", "sleep 60")]
 
 
 def test_tool_report_for_unknown_request_is_noop():
     tracker, _, clock = make_tracker()
-    tracker.on_tool_report("unknown", [("Bash", "x")], clock.now)
+    tracker.on_tool_report("unknown", [("Bash", "x")])
     assert not tracker.sessions
 
 
@@ -134,7 +128,7 @@ def test_priorities_reflect_predictions_and_flight_state():
     predictor.record([("Bash", "x")], 50.0)
 
     tracker.on_request_finished(make_request("r1", hashes("a")), block_ids=[1])
-    tracker.on_tool_report("r1", [("Bash", "y")], clock.now)
+    tracker.on_tool_report("r1", [("Bash", "y")])
     tracker.on_request_finished(
         make_request("r2", hashes("b")), block_ids=[2]
     )  # awaiting report
@@ -158,9 +152,9 @@ def test_classify_block_picks_min_priority_owner():
     predictor.record([("Slow", "x")], 1000.0)
     # Both sessions own the shared block 1.
     tracker.on_request_finished(make_request("r1", hashes("s", "a")), block_ids=[1, 2])
-    tracker.on_tool_report("r1", [("Fast", "x")], clock.now)
+    tracker.on_tool_report("r1", [("Fast", "x")])
     tracker.on_request_finished(make_request("r2", hashes("s", "b")), block_ids=[1, 3])
-    tracker.on_tool_report("r2", [("Slow", "x")], clock.now)
+    tracker.on_tool_report("r2", [("Slow", "x")])
 
     sid_fast = tracker.by_tail_hash[b"a"]
     tracker.priorities(clock.now)
@@ -220,4 +214,5 @@ def test_malformed_hint_ignored():
     tracker.on_request_finished(req, block_ids=[1])
     session = next(iter(tracker.sessions.values()))
     assert session.pending_tools is None
-    assert not session.tools_from_hint
+    # A malformed hint degrades to awaiting a parsed report.
+    assert "r1" in tracker.recently_finished

@@ -203,12 +203,17 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(
+        self, request: Request, record_stats: bool = True
+    ) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
+            record_stats: Whether to record prefix cache stats. Set to False
+                for read-only queries (e.g. prefix-aware scheduling scores)
+                that don't lead to an allocation.
 
         Returns:
             A tuple containing:
@@ -235,7 +240,7 @@ class KVCacheManager:
             )
         )
 
-        if self.log_stats:
+        if record_stats and self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,
@@ -249,17 +254,12 @@ class KVCacheManager:
         """Estimate how many new blocks scheduling this request would need.
 
         Used by prefix-aware scheduling to rank waiting requests by prefix
-        cache overlap. Read-only: unlike get_computed_blocks, it does not
-        record prefix cache stats.
+        cache overlap; does not record prefix cache stats.
         """
         num_computed_tokens = request.num_computed_tokens
-        if (
-            num_computed_tokens == 0
-            and self.enable_caching
-            and not request.skip_reading_prefix_cache
-        ):
-            _, num_computed_tokens = self.coordinator.find_longest_cache_hit(
-                request.block_hashes, request.num_tokens - 1
+        if num_computed_tokens == 0:
+            _, num_computed_tokens = self.get_computed_blocks(
+                request, record_stats=False
             )
         num_new_tokens = request.num_tokens - num_computed_tokens
         return cdiv(num_new_tokens, self.coordinator.scheduler_block_size)

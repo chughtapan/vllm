@@ -201,7 +201,6 @@ class SchedulerInterface(ABC):
         self,
         request_id: str,
         tool_calls: list[tuple[str, str]],
-        finish_ts: float,
     ) -> None:
         """Attach tool calls parsed by the API layer to a finished request.
 

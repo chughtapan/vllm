@@ -1088,7 +1088,8 @@ class Scheduler(SchedulerInterface):
         )
         if self.cachewise is not None:
             self.cachewise.on_request_preempted(
-                request, self._cachewise_block_ids(request)
+                request,
+                self.kv_cache_manager.get_block_ids(request.request_id)[0],
             )
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
@@ -2021,29 +2022,20 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         if self.cachewise is not None:
             self.cachewise.on_request_finished(
-                request, self._cachewise_block_ids(request)
+                request,
+                self.kv_cache_manager.get_block_ids(request.request_id)[0],
             )
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
-
-    def _cachewise_block_ids(self, request: Request) -> list[int]:
-        """Block ids of a request's (single-group) KV cache blocks."""
-        blocks = self.kv_cache_manager.get_blocks(request.request_id)
-        return [block.block_id for block in blocks.blocks[0]]
 
     def cachewise_report_tool_calls(
         self,
         request_id: str,
         tool_calls: list[tuple[str, str]],
-        finish_ts: float,
     ) -> None:
         """Attach tool calls parsed by the API layer to a finished request."""
         if self.cachewise is not None:
-            self.cachewise.report_tool_calls(
-                request_id,
-                [(name, args) for name, args in tool_calls],
-                finish_ts,
-            )
+            self.cachewise.report_tool_calls(request_id, tool_calls)
 
     @property
     def pause_state(self) -> PauseState:

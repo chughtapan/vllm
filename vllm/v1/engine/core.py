@@ -655,7 +655,6 @@ class EngineCore:
         self,
         request_id: str,
         tool_calls: list[tuple[str, str]],
-        finish_ts: float,
     ) -> None:
         """Attach tool calls parsed by the API layer to a finished request.
 
@@ -666,7 +665,6 @@ class EngineCore:
         self.scheduler.cachewise_report_tool_calls(
             request_id,
             [(name, args) for name, args in tool_calls],
-            finish_ts,
         )
 
     def reset_encoder_cache(self) -> None:

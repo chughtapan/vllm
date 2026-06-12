@@ -5,8 +5,11 @@
 import json
 import math
 import os
+from collections import deque
+from collections.abc import Sequence
 
 from vllm.logger import init_logger
+from vllm.utils.import_utils import has_sklearn
 
 logger = init_logger(__name__)
 
@@ -26,6 +29,9 @@ _LOG_STEP = (_LOG_MAX - _LOG_MIN) / _NUM_BINS
 _MIN_SAMPLES_FOR_CLUSTERING = 100
 # Number of new samples per tool between clustering refits.
 _REFIT_SAMPLE_INTERVAL = 256
+# Refits run inline on the engine loop; bounding the per-tool sample buffer
+# keeps each refit's cost and memory constant.
+_MAX_SAMPLES_PER_KEY = 2048
 _NUM_CLUSTERS = 8
 _TFIDF_MAX_FEATURES = 512
 
@@ -37,9 +43,8 @@ def _bin_index(duration_s: float) -> int:
     return min(idx, _NUM_BINS - 1)
 
 
-def _bin_mean(idx: int) -> float:
-    """Geometric mean of a bin's bounds, used as its representative value."""
-    return math.exp(_LOG_MIN + (idx + 0.5) * _LOG_STEP)
+# Geometric mean of each bin's bounds, used as its representative value.
+_BIN_MEANS = [math.exp(_LOG_MIN + (idx + 0.5) * _LOG_STEP) for idx in range(_NUM_BINS)]
 
 
 class DurationDistribution:
@@ -75,7 +80,7 @@ class DurationDistribution:
             count = self.counts[idx]
             if count == 0:
                 continue
-            bin_mean = _bin_mean(idx)
+            bin_mean = _BIN_MEANS[idx]
             if bin_mean <= elapsed_s:
                 continue
             surviving += count
@@ -105,28 +110,21 @@ class ToolReusePredictor:
         self.global_dist = DurationDistribution()
         self.tool_dists: dict[str, DurationDistribution] = {}
 
-        self.use_clustering = use_clustering and self._sklearn_available()
+        self.use_clustering = use_clustering and has_sklearn()
         if use_clustering and not self.use_clustering:
             logger.warning_once(
                 "cachewise_predictor='tfidf_kmeans' requires scikit-learn; "
                 "falling back to per-tool-name distributions."
             )
-        # Per-tool raw samples retained for clustering refits, and the
-        # fitted per-tool models: (vectorizer, kmeans, cluster distributions).
-        self._samples: dict[str, list[tuple[str, float]]] = {}
+        # Per-tool raw samples retained for clustering refits (bounded so
+        # refit cost and memory stay constant), and the fitted per-tool
+        # models: (vectorizer, kmeans, cluster distributions).
+        self._samples: dict[str, deque[tuple[str, float]]] = {}
         self._samples_since_refit: dict[str, int] = {}
         self._cluster_models: dict[str, tuple] = {}
 
         if bootstrap_path is not None:
             self._load_bootstrap(bootstrap_path)
-
-    @staticmethod
-    def _sklearn_available() -> bool:
-        try:
-            import sklearn  # noqa: F401
-        except ImportError:
-            return False
-        return True
 
     @staticmethod
     def _key(tools: list[tuple[str, str]]) -> str:
@@ -150,7 +148,10 @@ class ToolReusePredictor:
         self.global_dist.record(duration_s)
         if self.use_clustering and key != HUMAN_PAUSE_KEY:
             args = " ".join(arg for _, arg in tools)
-            self._samples.setdefault(key, []).append((args, duration_s))
+            samples = self._samples.get(key)
+            if samples is None:
+                samples = self._samples[key] = deque(maxlen=_MAX_SAMPLES_PER_KEY)
+            samples.append((args, duration_s))
             self._samples_since_refit[key] = self._samples_since_refit.get(key, 0) + 1
 
     def predict_remaining(
@@ -195,7 +196,7 @@ class ToolReusePredictor:
         if not self.use_clustering:
             return
         for key, pending in list(self._samples_since_refit.items()):
-            samples = self._samples.get(key, [])
+            samples: Sequence[tuple[str, float]] = self._samples.get(key, ())
             if len(samples) < _MIN_SAMPLES_FOR_CLUSTERING:
                 continue
             if key in self._cluster_models and pending < _REFIT_SAMPLE_INTERVAL:
@@ -203,7 +204,7 @@ class ToolReusePredictor:
             self._refit_tool(key, samples)
             self._samples_since_refit[key] = 0
 
-    def _refit_tool(self, key: str, samples: list[tuple[str, float]]) -> None:
+    def _refit_tool(self, key: str, samples: Sequence[tuple[str, float]]) -> None:
         from sklearn.cluster import MiniBatchKMeans
         from sklearn.feature_extraction.text import TfidfVectorizer
 

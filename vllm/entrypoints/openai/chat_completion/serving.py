@@ -193,16 +193,11 @@ class OpenAIServingChat(OpenAIServing):
         """
         if not self.enable_kv_reuse_reporting or num_choices > 1:
             return
-        try:
-            task = asyncio.create_task(
-                self.engine_client.cachewise_report_tool_calls(
-                    request_id, tool_calls, time.time()
-                )
-            )
-            task.add_done_callback(self._kv_reuse_report_tasks.discard)
-            self._kv_reuse_report_tasks.add(task)
-        except Exception:
-            logger.warning_once("Failed to report tool calls for KV reuse.")
+        task = asyncio.create_task(
+            self.engine_client.cachewise_report_tool_calls(request_id, tool_calls)
+        )
+        task.add_done_callback(self._kv_reuse_report_tasks.discard)
+        self._kv_reuse_report_tasks.add(task)
 
     def _effective_chat_template_kwargs(
         self, request: ChatCompletionRequest
@@ -437,8 +432,8 @@ class OpenAIServingChat(OpenAIServing):
         num_cached_tokens = None
         tools_streamed = [False] * num_choices
         # Per-choice tool calls accumulated from deltas for KV reuse
-        # reporting: tool index -> [name, concatenated arguments].
-        streamed_tool_call_parts: list[dict[int, list[str]]] = [
+        # reporting: tool index -> [name, argument fragments].
+        streamed_tool_call_parts: list[dict[int, tuple[str, list[str]]]] = [
             {} for _ in range(num_choices)
         ]
 
@@ -626,13 +621,14 @@ class OpenAIServingChat(OpenAIServing):
                                 if self.enable_kv_reuse_reporting:
                                     parts = streamed_tool_call_parts[i]
                                     for tc in delta_message.tool_calls:
-                                        part = parts.setdefault(tc.index, ["", ""])
                                         if tc.function is None:
                                             continue
+                                        name, args = parts.get(tc.index, ("", []))
                                         if tc.function.name:
-                                            part[0] = tc.function.name
+                                            name = tc.function.name
                                         if tc.function.arguments:
-                                            part[1] += tc.function.arguments
+                                            args.append(tc.function.arguments)
+                                        parts[tc.index] = (name, args)
 
                             if (
                                 delta_message.reasoning
@@ -747,9 +743,9 @@ class OpenAIServingChat(OpenAIServing):
                             request_id,
                             num_choices=num_choices,
                             tool_calls=[
-                                (parts[idx][0], parts[idx][1])
-                                for idx in sorted(parts)
-                                if parts[idx][0]
+                                (name, "".join(args))
+                                for name, args in (parts[idx] for idx in sorted(parts))
+                                if name
                             ],
                         )
 

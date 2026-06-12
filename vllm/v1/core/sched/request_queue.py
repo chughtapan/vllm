@@ -218,7 +218,8 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
 
     The score of a waiting request changes as blocks are cached and evicted,
     so selection is re-evaluated lazily: the cached choice is invalidated by
-    any queue mutation and by ``new_epoch()``.
+    any queue mutation, and per-request scores are memoized until
+    ``new_epoch()`` (i.e. for one scheduling step, bounding staleness).
     """
 
     def __init__(
@@ -232,6 +233,14 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
         self._max_wait_s = max_wait_s
         self._max_candidates = max_candidates
         self._selected: Request | None = None
+        self._scores: dict[str, int] = {}
+
+    def _score(self, request: Request) -> int:
+        assert self._scorer is not None
+        score = self._scores.get(request.request_id)
+        if score is None:
+            score = self._scores[request.request_id] = self._scorer(request)
+        return score
 
     def _select_request(self) -> Request:
         if not self:
@@ -245,13 +254,13 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
             self._selected = head
             return head
         best = head
-        best_score = self._scorer(head)
+        best_score = self._score(head)
         for index, request in enumerate(self):
             if index == 0:
                 continue
             if index >= self._max_candidates:
                 break
-            score = self._scorer(request)
+            score = self._score(request)
             if score < best_score:
                 best, best_score = request, score
         self._selected = best
@@ -290,6 +299,7 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
 
     def new_epoch(self) -> None:
         self._selected = None
+        self._scores.clear()
 
 
 def create_request_queue(

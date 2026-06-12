@@ -26,11 +26,9 @@ async def test_reports_tool_calls():
         "req-1", num_choices=1, tool_calls=[("Bash", "pytest -x")]
     )
     await asyncio.gather(*serving._kv_reuse_report_tasks)
-    serving.engine_client.cachewise_report_tool_calls.assert_awaited_once()
-    args = serving.engine_client.cachewise_report_tool_calls.await_args.args
-    assert args[0] == "req-1"
-    assert args[1] == [("Bash", "pytest -x")]
-    assert isinstance(args[2], float)
+    serving.engine_client.cachewise_report_tool_calls.assert_awaited_once_with(
+        "req-1", [("Bash", "pytest -x")]
+    )
 
 
 @pytest.mark.asyncio

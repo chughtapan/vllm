@@ -5,6 +5,7 @@ prefix-aware scheduling."""
 
 import json
 
+from tests.v1.core.cachewise.utils import FakeClock
 from tests.v1.core.utils import EOS_TOKEN_ID, create_scheduler
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
@@ -19,14 +20,6 @@ BLOCK_SIZE = 16
 # NONE_HASH seeds randomly on each init; initialize once so block hash
 # chains match across requests within the test session.
 init_none_hash(sha256)
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        return self.now
 
 
 def make_request(

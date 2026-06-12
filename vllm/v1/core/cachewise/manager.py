@@ -4,7 +4,6 @@
 duration predictor, and the predictive eviction queue."""
 
 import time
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
@@ -42,15 +41,12 @@ class CacheWiseManager:
     so freed blocks are ordered by predicted time-to-next-reuse.
     """
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        time_fn: Callable[[], float] = time.time,
-    ) -> None:
+    def __init__(self, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
         self.rebuild_interval = cache_config.cachewise_rebuild_interval
         self.default_reuse_s = cache_config.cachewise_default_reuse_s
-        self.time_fn = time_fn
+        # Attribute (not a constructor parameter) so tests can patch it.
+        self.time_fn = time.time
 
         self.predictor = ToolReusePredictor(
             default_reuse_s=self.default_reuse_s,
@@ -61,11 +57,10 @@ class CacheWiseManager:
             predictor=self.predictor,
             default_reuse_s=self.default_reuse_s,
             session_ttl_s=cache_config.cachewise_session_ttl,
-            time_fn=time_fn,
         )
         self.queue: PredictiveFreeBlockQueue | None = None
         self._last_rebuild_step = 0
-        self._last_stats_log_ts = time_fn()
+        self._last_stats_log_ts = self.time_fn()
 
     def create_free_queue(
         self, blocks: list["KVCacheBlock"]
@@ -103,10 +98,8 @@ class CacheWiseManager:
     def on_request_preempted(self, request: "Request", block_ids: list[int]) -> None:
         self.tracker.on_request_preempted(request, block_ids)
 
-    def report_tool_calls(
-        self, request_id: str, tool_calls: ToolCalls, finish_ts: float
-    ) -> None:
-        self.tracker.on_tool_report(request_id, tool_calls, finish_ts)
+    def report_tool_calls(self, request_id: str, tool_calls: ToolCalls) -> None:
+        self.tracker.on_tool_report(request_id, tool_calls)
 
     def on_reset_prefix_cache(self) -> None:
         self.tracker.clear()
