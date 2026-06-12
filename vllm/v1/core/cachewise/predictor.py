@@ -6,7 +6,8 @@ import json
 import math
 import os
 from collections import OrderedDict, deque
-from collections.abc import Sequence
+from concurrent.futures import Executor, Future
+from functools import partial
 
 from vllm.logger import init_logger
 from vllm.utils.import_utils import has_sklearn
@@ -109,6 +110,7 @@ class ToolReusePredictor:
         default_reuse_s: float,
         use_clustering: bool = False,
         bootstrap_path: str | None = None,
+        refit_executor: "Executor | None" = None,
     ) -> None:
         self.default_reuse_s = default_reuse_s
         self.global_dist = DurationDistribution()
@@ -128,6 +130,10 @@ class ToolReusePredictor:
         self._samples: dict[str, deque[tuple[str, float]]] = {}
         self._samples_since_refit: dict[str, int] = {}
         self._cluster_models: dict[str, tuple] = {}
+        # When set, cluster fits run here instead of on the calling (engine)
+        # thread; keys with a fit in flight are tracked to avoid re-submitting.
+        self._refit_executor = refit_executor
+        self._inflight_refits: set[str] = set()
 
         if bootstrap_path is not None:
             self._load_bootstrap(bootstrap_path)
@@ -208,20 +214,51 @@ class ToolReusePredictor:
         """Refit argument clusters for tools that accumulated enough samples.
 
         Amortized: each tool refits only after ``_REFIT_SAMPLE_INTERVAL`` new
-        samples, keeping the engine-loop overhead negligible.
+        samples. With an executor the fit runs off-thread and the model is
+        swapped in atomically on completion, so the scheduler loop never
+        blocks on sklearn; without one it fits synchronously (tests, simple
+        deployments).
         """
         if not self.use_clustering:
             return
         for key, pending in list(self._samples_since_refit.items()):
-            samples: Sequence[tuple[str, float]] = self._samples.get(key, ())
+            samples = self._samples.get(key, ())
             if len(samples) < _MIN_SAMPLES_FOR_CLUSTERING:
                 continue
             if key in self._cluster_models and pending < _REFIT_SAMPLE_INTERVAL:
                 continue
-            self._refit_tool(key, samples)
             self._samples_since_refit[key] = 0
+            self._submit_refit(key, list(samples))
 
-    def _refit_tool(self, key: str, samples: Sequence[tuple[str, float]]) -> None:
+    def _submit_refit(self, key: str, samples: list[tuple[str, float]]) -> None:
+        # Snapshot is taken by the caller so the worker never reads a deque
+        # the engine thread is mutating.
+        if self._refit_executor is None:
+            model = self._fit_tool(key, samples)
+            if model is not None:
+                self._cluster_models[key] = model
+            return
+        if key in self._inflight_refits:
+            return
+        self._inflight_refits.add(key)
+        future = self._refit_executor.submit(self._fit_tool, key, samples)
+        future.add_done_callback(partial(self._on_refit_done, key))
+
+    def _on_refit_done(self, key: str, future: Future) -> None:
+        self._inflight_refits.discard(key)
+        try:
+            model = future.result()
+        except Exception:
+            logger.warning_once("CacheWise cluster refit failed for %r", key)
+            return
+        # dict assignment is atomic under CPython; predict only reads the tuple.
+        if model is not None:
+            self._cluster_models[key] = model
+
+    @staticmethod
+    def _fit_tool(key: str, samples: list[tuple[str, float]]) -> "tuple | None":
+        """Fit TF-IDF + KMeans for one tool key. Pure: returns the model
+        tuple (vectorizer, kmeans, cluster distributions) or None."""
         from sklearn.cluster import MiniBatchKMeans
         from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -236,17 +273,11 @@ class ToolReusePredictor:
             labels = kmeans.fit_predict(matrix)
         except ValueError:
             # E.g. empty vocabulary when all arguments are stop words.
-            return
+            return None
         cluster_dists = [DurationDistribution() for _ in range(n_clusters)]
         for (_, duration_s), label in zip(samples, labels):
             cluster_dists[label].record(duration_s)
-        self._cluster_models[key] = (vectorizer, kmeans, cluster_dists)
-        logger.debug(
-            "CacheWise refit %d clusters for tool key %r over %d samples",
-            n_clusters,
-            key,
-            len(samples),
-        )
+        return (vectorizer, kmeans, cluster_dists)
 
     def _load_bootstrap(self, path: str) -> None:
         if not os.path.exists(path):

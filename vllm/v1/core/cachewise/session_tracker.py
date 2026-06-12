@@ -42,6 +42,12 @@ _MAX_TOOLS_PER_TURN = 32
 _MAX_TOOL_NAME_LEN = 128
 _MAX_TOOL_ARGS_LEN = 4096
 
+# Upper bound on tracked sessions. Each finished request that doesn't match an
+# existing session creates one; without a cap, high-QPS non-agent traffic would
+# grow the maps and the per-rebuild priorities()/prune() scans without bound.
+# The oldest idle session is evicted past this (its blocks fall back to LRU).
+_MAX_SESSIONS = 8192
+
 ToolCalls = list[tuple[str, str]]
 
 
@@ -73,7 +79,9 @@ class SessionTracker:
         self.session_ttl_s = session_ttl_s
         self.time_fn = time_fn
 
-        self.sessions: dict[int, Session] = {}
+        # LRU-ordered (oldest first) so the cap evicts least-recently-finished
+        # idle sessions; an active (in_flight) session is never evicted.
+        self.sessions: OrderedDict[int, Session] = OrderedDict()
         self.by_tail_hash: dict[bytes, int] = {}
         # In-flight request id -> session id.
         self.by_request_id: dict[str, int] = {}
@@ -167,6 +175,19 @@ class SessionTracker:
                 session.session_id,
                 session.last_finish_ts + _TOOL_REPORT_WINDOW_S,
             )
+
+        # Mark most-recently-active and evict oldest idle sessions past the cap.
+        self.sessions.move_to_end(session.session_id)
+        self._enforce_session_cap()
+
+    def _enforce_session_cap(self) -> None:
+        if len(self.sessions) <= _MAX_SESSIONS:
+            return
+        for session in list(self.sessions.values()):
+            if len(self.sessions) <= _MAX_SESSIONS:
+                break
+            if not session.in_flight:
+                self._drop_session(session)
 
     def on_tool_report(self, request_id: str, tools: ToolCalls) -> None:
         """Attach tool calls parsed by the API layer to a finished request."""

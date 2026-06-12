@@ -4,6 +4,7 @@
 duration predictor, and the predictive eviction queue."""
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
@@ -48,10 +49,19 @@ class CacheWiseManager:
         # Attribute (not a constructor parameter) so tests can patch it.
         self.time_fn = time.time
 
+        # Cluster fits run on a single background thread so the scheduler loop
+        # never blocks on sklearn; only created when clustering is enabled.
+        use_clustering = cache_config.cachewise_predictor == "tfidf_kmeans"
+        self._refit_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="cachewise-refit")
+            if use_clustering
+            else None
+        )
         self.predictor = ToolReusePredictor(
             default_reuse_s=self.default_reuse_s,
-            use_clustering=cache_config.cachewise_predictor == "tfidf_kmeans",
+            use_clustering=use_clustering,
             bootstrap_path=cache_config.cachewise_bootstrap_path,
+            refit_executor=self._refit_executor,
         )
         self.tracker = SessionTracker(
             predictor=self.predictor,

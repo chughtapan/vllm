@@ -144,3 +144,32 @@ def test_clustering_refit_and_predict():
     )
     fast = predictor.predict_remaining([("Bash", "ls quick listing")], 0.0)
     assert slow > fast
+
+
+def test_clustering_refit_runs_off_thread():
+    pytest.importorskip("sklearn")
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    # Occupy the single worker so the refit must queue behind it; this makes
+    # the "submitted, not run inline" assertion deterministic.
+    release = threading.Event()
+    executor.submit(release.wait)
+
+    predictor = ToolReusePredictor(
+        default_reuse_s=10.0, use_clustering=True, refit_executor=executor
+    )
+    for _ in range(60):
+        predictor.record([("Bash", "pytest slow suite")], 100.0)
+        predictor.record([("Bash", "ls quick listing")], 0.1)
+    predictor.maybe_refit()
+    # The fit was submitted (queued behind the blocker), not run inline.
+    assert "Bash" in predictor._inflight_refits
+    assert "Bash" not in predictor._cluster_models
+
+    release.set()
+    executor.shutdown(wait=True)  # let the queued fit run and drain
+    # The done-callback swapped the model in and cleared the in-flight mark.
+    assert "Bash" in predictor._cluster_models
+    assert not predictor._inflight_refits

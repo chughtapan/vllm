@@ -187,6 +187,36 @@ def test_preempted_then_aborted_clears_tag():
     assert PREEMPTED_SESSION_ID not in tracker.priorities(clock.now)
 
 
+def test_session_count_is_capped(monkeypatch):
+    monkeypatch.setattr("vllm.v1.core.cachewise.session_tracker._MAX_SESSIONS", 4)
+    tracker, _, clock = make_tracker()
+    for i in range(20):
+        tracker.on_request_finished(
+            make_request(f"r{i}", hashes(f"h{i}")), block_ids=[i]
+        )
+        clock.now += 1.0
+    assert len(tracker.sessions) <= 4
+    # The oldest sessions were dropped; their tail hashes no longer match.
+    assert tracker.by_tail_hash.get(b"h0") is None
+    # Maps stay consistent with the surviving sessions.
+    assert set(tracker.by_tail_hash.values()) == set(tracker.sessions)
+
+
+def test_in_flight_sessions_survive_cap(monkeypatch):
+    monkeypatch.setattr("vllm.v1.core.cachewise.session_tracker._MAX_SESSIONS", 2)
+    tracker, _, clock = make_tracker()
+    # An active session (returned, in flight) must not be evicted by the cap.
+    tracker.on_request_finished(make_request("r0", hashes("keep")), block_ids=[0])
+    ret = make_request("r0b", hashes("keep", "more"), arrival_time=clock.now)
+    tracker.on_request_scheduled(ret)
+    kept_sid = tracker.by_request_id["r0b"]
+    for i in range(10):
+        tracker.on_request_finished(
+            make_request(f"r{i}", hashes(f"h{i}")), block_ids=[100 + i]
+        )
+    assert kept_sid in tracker.sessions
+
+
 def test_hint_size_is_capped():
     tracker, _, _ = make_tracker()
     big_hint = [{"name": "x" * 9999, "args": "y" * 99999} for _ in range(1000)]

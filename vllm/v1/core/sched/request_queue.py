@@ -4,7 +4,7 @@
 import heapq
 import time
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Iterator
 from enum import Enum
 
@@ -206,7 +206,7 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
-class PrefixAwareRequestQueue(FCFSRequestQueue):
+class PrefixAwareRequestQueue(RequestQueue):
     """A queue that serves the request needing the fewest new KV blocks.
 
     Requests are stored in arrival order, but peek/pop select the request
@@ -216,10 +216,13 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
     regardless of its score, and at most ``max_candidates`` of the oldest
     requests are scored per selection.
 
-    The score of a waiting request changes as blocks are cached and evicted,
-    so selection is re-evaluated lazily: the cached choice is invalidated by
-    any queue mutation, and per-request scores are memoized until
-    ``new_epoch()`` (i.e. for one scheduling step, bounding staleness).
+    Backed by an ``OrderedDict`` keyed by request id so that the
+    select-then-remove-from-middle access pattern is O(1) per operation
+    (a deque would make pop_request O(n)). The score of a waiting request
+    changes as blocks are cached and evicted, so selection is re-evaluated
+    lazily: the cached choice is invalidated by any queue mutation, and
+    per-request scores are memoized until ``new_epoch()`` (i.e. for one
+    scheduling step, bounding staleness).
     """
 
     def __init__(
@@ -228,7 +231,7 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
         max_wait_s: float = 0.0,
         max_candidates: int = 64,
     ) -> None:
-        super().__init__()
+        self._requests: OrderedDict[str, Request] = OrderedDict()
         self._scorer = scorer
         self._max_wait_s = max_wait_s
         self._max_candidates = max_candidates
@@ -243,11 +246,11 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
         return score
 
     def _select_request(self) -> Request:
-        if not self:
+        if not self._requests:
             raise IndexError("peek from an empty queue")
         if self._selected is not None:
             return self._selected
-        head = self[0]
+        head = next(iter(self._requests.values()))
         if self._scorer is None or (
             self._max_wait_s > 0 and time.time() - head.arrival_time > self._max_wait_s
         ):
@@ -255,7 +258,7 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
             return head
         best = head
         best_score = self._score(head)
-        for index, request in enumerate(self):
+        for index, request in enumerate(self._requests.values()):
             if index == 0:
                 continue
             if index >= self._max_candidates:
@@ -273,29 +276,47 @@ class PrefixAwareRequestQueue(FCFSRequestQueue):
     def pop_request(self) -> Request:
         """Pop the best-overlap request (the one last peeked)."""
         request = self._select_request()
-        self.remove(request)
+        del self._requests[request.request_id]
+        self._scores.pop(request.request_id, None)
         self._selected = None
         return request
 
     def add_request(self, request: Request) -> None:
         self._selected = None
-        super().add_request(request)
+        self._requests[request.request_id] = request
 
     def prepend_request(self, request: Request) -> None:
         self._selected = None
-        super().prepend_request(request)
+        self._requests[request.request_id] = request
+        self._requests.move_to_end(request.request_id, last=False)
 
     def prepend_requests(self, requests: RequestQueue) -> None:
+        # Prepend in reverse so the donor queue's order is preserved at the
+        # front (matches FCFSRequestQueue.extendleft semantics).
         self._selected = None
-        super().prepend_requests(requests)
+        for request in reversed(list(requests)):
+            self._requests[request.request_id] = request
+            self._requests.move_to_end(request.request_id, last=False)
 
     def remove_request(self, request: Request) -> None:
         self._selected = None
-        super().remove_request(request)
+        del self._requests[request.request_id]
+        self._scores.pop(request.request_id, None)
 
     def remove_requests(self, requests: Iterable[Request]) -> None:
         self._selected = None
-        super().remove_requests(requests)
+        for request in requests:
+            self._requests.pop(request.request_id, None)
+            self._scores.pop(request.request_id, None)
+
+    def __bool__(self) -> bool:
+        return bool(self._requests)
+
+    def __len__(self) -> int:
+        return len(self._requests)
+
+    def __iter__(self) -> Iterator[Request]:
+        return iter(self._requests.values())
 
     def new_epoch(self) -> None:
         self._selected = None
